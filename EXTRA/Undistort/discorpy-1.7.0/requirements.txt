@@ -1,0 +1,7 @@
+#python>=3.9
+numpy
+scipy
+scikit-image
+pillow
+matplotlib
+h5py

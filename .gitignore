@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# App runtime artifacts
+temp_workspace/
+startup.log
+*.log
+
+# Bundled binaries (too large for git — see README Dependencies section)
+Dependencies/
+
+# Vendored source archives (extracted dirs are tracked instead)
+EXTRA/**/*.zip
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
