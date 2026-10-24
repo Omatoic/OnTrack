@@ -10,11 +10,13 @@ from PySide6.QtGui import QImage, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -30,6 +32,8 @@ class ARPreviewWidget(QWidget):
     origin_set = Signal(object)
     scale_applied = Signal(float)
     z_rotation_changed = Signal(float)
+    resolve_requested = Signal(list)  # list of bad points3D ids to prune + re-solve
+    smoothing_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -205,6 +209,78 @@ class ARPreviewWidget(QWidget):
         z_layout.addWidget(self._z_rotation)
         right.addLayout(z_layout)
 
+        # --- Track health ---
+        health_group = QGroupBox("Track health")
+        health_layout = QVBoxLayout(health_group)
+        self._error_stats = QLabel("Reprojection error: -")
+        self._error_stats.setWordWrap(True)
+        self._error_stats.setStyleSheet("color: #a0a0a0;")
+        health_layout.addWidget(self._error_stats)
+
+        thresh_layout = QHBoxLayout()
+        thresh_layout.addWidget(QLabel("Error threshold (px):"))
+        self._error_threshold = QDoubleSpinBox()
+        self._error_threshold.setRange(0.0, 100.0)
+        self._error_threshold.setValue(2.0)
+        self._error_threshold.setDecimals(2)
+        self._error_threshold.setToolTip(
+            "Points whose mean reprojection error is ABOVE this value are shown red "
+            "and can be pruned. Higher threshold = fewer bad points."
+        )
+        self._error_threshold.valueChanged.connect(self._on_error_threshold_changed)
+        thresh_layout.addWidget(self._error_threshold)
+        health_layout.addLayout(thresh_layout)
+
+        tlen_layout = QHBoxLayout()
+        tlen_layout.addWidget(QLabel("Min track length:"))
+        self._min_track_len = QSpinBox()
+        self._min_track_len.setRange(0, 100)
+        self._min_track_len.setValue(0)
+        self._min_track_len.setToolTip(
+            "Points seen in fewer frames than this are treated as bad (shown red)."
+            " Short 2-3 frame tracks are usually junk. 0 = disabled."
+        )
+        self._min_track_len.valueChanged.connect(self._on_error_threshold_changed)
+        tlen_layout.addWidget(self._min_track_len)
+        health_layout.addLayout(tlen_layout)
+
+        prune_layout = QHBoxLayout()
+        self._prune_threshold_btn = QPushButton("Prune + Re-solve")
+        self._prune_threshold_btn.setEnabled(False)
+        self._prune_threshold_btn.setToolTip(
+            "Delete every point above the threshold and re-run GLOMAP."
+        )
+        prune_layout.addWidget(self._prune_threshold_btn)
+
+        self._delete_selected_btn = QPushButton("Delete selected + Re-solve")
+        self._delete_selected_btn.setEnabled(False)
+        self._delete_selected_btn.setToolTip(
+            "Delete the currently selected point-cloud points and re-run GLOMAP."
+        )
+        self._delete_selected_btn.clicked.connect(self._delete_selected_and_resolve)
+        prune_layout.addWidget(self._delete_selected_btn)
+        health_layout.addLayout(prune_layout)
+
+        self._prune_threshold_btn.clicked.connect(self._prune_threshold_and_resolve)
+
+        # --- Smoothing ---
+        smooth_group = QGroupBox("Track smoothing")
+        smooth_layout = QHBoxLayout(smooth_group)
+        smooth_layout.addWidget(QLabel("Window (frames):"))
+        self._smooth_window = QSpinBox()
+        self._smooth_window.setRange(0, 61)
+        self._smooth_window.setValue(0)
+        self._smooth_window.setToolTip(
+            "Savitzky-Golay temporal smoothing window for camera + object poses.\n"
+            "0 = off. 7-15 frames removes micro-jitter; higher values smooth more\n"
+            "but can lag fast deliberate motion."
+        )
+        self._smooth_window.valueChanged.connect(self.smoothing_changed)
+        smooth_layout.addWidget(self._smooth_window)
+
+        right.addWidget(smooth_group)
+        right.addWidget(health_group)
+
         right.addStretch()
         layout.addLayout(right)
 
@@ -215,11 +291,15 @@ class ARPreviewWidget(QWidget):
         point_cloud: list[dict[str, Any]] | None = None,
         orientation: tuple[np.ndarray, np.ndarray] | None = None,
         z_rotation: float = 0.0,
+        object_track: list[dict[str, Any]] | None = None,
     ) -> None:
         if not track:
             self._frame_label.setText("No track data")
             return
-        self._renderer = ARPreviewRenderer(frames_dir, track, point_cloud)
+        self._renderer = ARPreviewRenderer(frames_dir, track, point_cloud, object_track=object_track)
+        self._renderer.error_threshold = self._error_threshold.value()
+        self._renderer.min_track_len = self._min_track_len.value()
+        self._update_error_stats()
         if orientation is not None:
             self._renderer.set_orientation(*orientation)
             self._reset_btn.setEnabled(True)
@@ -232,6 +312,7 @@ class ARPreviewWidget(QWidget):
         self._play_btn.setEnabled(True)
         self._clear_selections()
         self._update_object()
+        self._update_error_stats()
         self._update_info()
 
     def _on_frame_press(self, event: QMouseEvent) -> None:
@@ -460,6 +541,7 @@ class ARPreviewWidget(QWidget):
         self._floor_btn.setEnabled(has_pending)
         self._wall_btn.setEnabled(has_pending)
         self._scale_btn.setEnabled(has_pending and len(self._selected_scale) < 2)
+        self._delete_selected_btn.setEnabled(has_pending and any("id" in p for p in self._pending_selection))
 
     def _update_selection_info(self) -> None:
         origin = "yes" if self._selected_origin is not None else "none"
@@ -632,6 +714,60 @@ class ARPreviewWidget(QWidget):
             draw_point(p, (255, 0, 255), 18)
         for p in self._pending_selection:
             draw_point(p, (255, 255, 0), 18)
+
+    def _on_error_threshold_changed(self) -> None:
+        if self._renderer is not None:
+            self._renderer.error_threshold = self._error_threshold.value()
+            self._renderer.min_track_len = self._min_track_len.value()
+        self._update_error_stats()
+        self._render_current()
+
+    def _is_bad_point(self, p: dict[str, Any]) -> bool:
+        threshold = self._error_threshold.value()
+        min_len = self._min_track_len.value()
+        if threshold > 0 and p.get("error", 0.0) > threshold:
+            return True
+        if min_len > 0 and len(p.get("track", [])) < min_len:
+            return True
+        return False
+
+    def _update_error_stats(self) -> None:
+        if self._renderer is None or not self._renderer.point_cloud:
+            self._error_stats.setText("Reprojection error: -")
+            return
+        cloud = self._renderer.point_cloud
+        errors = np.array([p.get("error", 0.0) for p in cloud], dtype=np.float64)
+        errors = errors[np.isfinite(errors)]
+        if errors.size == 0:
+            self._error_stats.setText("Reprojection error: -")
+            return
+        mean = float(np.mean(errors))
+        median = float(np.median(errors))
+        p90 = float(np.percentile(errors, 90))
+        max_err = float(np.max(errors))
+        bad = sum(1 for p in cloud if self._is_bad_point(p))
+        self._error_stats.setText(
+            f"Reprojection error — mean {mean:.3f}px, median {median:.3f}px, "
+            f"p90 {p90:.3f}px, max {max_err:.3f}px.\n"
+            f"{bad} / {len(cloud)} points flagged bad (shown red)."
+        )
+        self._prune_threshold_btn.setEnabled(bad > 0)
+
+    def _prune_threshold_and_resolve(self) -> None:
+        if self._renderer is None:
+            return
+        bad_ids = [p["id"] for p in self._renderer.point_cloud if self._is_bad_point(p)]
+        if bad_ids:
+            self.resolve_requested.emit(bad_ids)
+
+    def _delete_selected_and_resolve(self) -> None:
+        bad_ids = [p["id"] for p in self._pending_selection if "id" in p]
+        if not bad_ids:
+            QMessageBox.information(self, "Nothing selected", "Select point-cloud points first.")
+            return
+        self.resolve_requested.emit(bad_ids)
+        self._clear_pending_selection()
+        self._update_button_states()
 
     def _update_info(self) -> None:
         if self._renderer is None:

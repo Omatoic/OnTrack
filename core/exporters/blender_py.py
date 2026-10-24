@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 # GLOMAP/COLMAP world: +X right, +Y down, +Z forward (into scene).
 # Blender world:        +X right, +Y forward, +Z up.
@@ -160,6 +162,8 @@ def export_glomap_to_blender(
             - ``point_cloud`` (optional): list of dicts with ``position`` keys.
             - ``camera_name`` (optional): name for the created camera object.
             - ``sensor_width_mm`` (optional): defaults to 36.0.
+            - ``object_track`` (optional): list of dicts with ``frame_number``,
+              ``position`` and ``orientation``.
     output_filepath : Path or str
         Destination .py file path.
     world_space : str
@@ -203,11 +207,28 @@ def export_glomap_to_blender(
     for p in point_cloud:
         cloud_points.append(_transform_point_to_blender(p["position"], apply_world_swap))
 
+    object_track = scene_data.get("object_track") or []
+    object_frames = []
+    for entry in object_track:
+        R_obj = np.asarray(entry["orientation"], dtype=np.float64)
+        pos = np.asarray(entry["position"], dtype=np.float64).tolist()
+        # Apply the same world-space swap used for the camera.
+        world = M_WORLD_SWAP if apply_world_swap else M_ORIENTED_FLIP
+        M = _matmul_4x4(world, _make_4x4(R_obj, pos))
+        R_blender = [[M[i][j] for j in range(3)] for i in range(3)]
+        t_blender = _matmul_4x4_vec3(world, pos)
+        object_frames.append({
+            "frame_number": entry["frame_number"],
+            "matrix_world": _make_4x4(R_blender, t_blender),
+            "inferred": entry.get("inferred", False),
+        })
+
     payload: dict[str, Any] = {
         "camera_name": camera_name,
         "sensor_width_mm": sensor_width_mm,
         "frame_data": frame_data,
         "point_cloud": cloud_points,
+        "object_frames": object_frames,
     }
 
     script = _generate_blender_script(payload)
@@ -232,6 +253,7 @@ CAMERA_NAME = DATA["camera_name"]
 SENSOR_WIDTH_MM = DATA["sensor_width_mm"]
 FRAME_DATA = DATA["frame_data"]
 POINT_CLOUD = DATA["point_cloud"]
+OBJECT_FRAMES = DATA.get("object_frames", [])
 
 scene = bpy.context.scene
 scene.frame_set(1)
@@ -291,6 +313,22 @@ origin_marker.empty_display_type = 'ARROWS'
 origin_marker.empty_display_size = 0.5
 bpy.context.collection.objects.link(origin_marker)
 
+# Animated object null for replacement work.
+if OBJECT_FRAMES:
+    obj_empty = bpy.data.objects.new("TrackedObject", None)
+    obj_empty.empty_display_type = 'ARROWS'
+    obj_empty.empty_display_size = 0.2
+    bpy.context.collection.objects.link(obj_empty)
+    for info in OBJECT_FRAMES:
+        frame = info["frame_number"]
+        scene.frame_set(frame)
+        obj_empty.matrix_world = mathutils.Matrix(info["matrix_world"])
+        obj_empty.keyframe_insert(data_path="location")
+        obj_empty.keyframe_insert(data_path="rotation_euler")
+        if info.get("inferred", False):
+            obj_empty.keyframe_insert(data_path="scale")
+    print(f"Imported {{len(OBJECT_FRAMES)}} object track frames")
+
 scene.frame_set(1)
 print("[debug] camera frame-1 location:", tuple(round(v, 4) for v in cam_obj.matrix_world.translation))
 print("[debug] camera frame-1 forward (-Z) :", tuple(round(v, 3) for v in (cam_obj.matrix_world.to_3x3() @ mathutils.Vector((0, 0, -1)))))
@@ -308,6 +346,7 @@ def generate_py(
     camera_name: str = "GLOMAP Camera",
     point_cloud: list[dict[str, Any]] | None = None,
     world_space: str = "glomap",
+    object_track: list[dict[str, Any]] | None = None,
 ) -> Path:
     """
     Legacy wrapper around :func:`export_glomap_to_blender`.
@@ -319,5 +358,6 @@ def generate_py(
         "track": track,
         "point_cloud": point_cloud,
         "camera_name": camera_name,
+        "object_track": object_track,
     }
     return export_glomap_to_blender(scene_data, output_path, world_space=world_space)

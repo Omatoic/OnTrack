@@ -49,6 +49,8 @@ def make_session_workspace(root: Path | None = None) -> Path:
     (session_dir / "02_database").mkdir(parents=True, exist_ok=True)
     (session_dir / "03_sparse").mkdir(parents=True, exist_ok=True)
     (session_dir / "04_masks").mkdir(parents=True, exist_ok=True)
+    (session_dir / "05_object_masks").mkdir(parents=True, exist_ok=True)
+    (session_dir / "06_object").mkdir(parents=True, exist_ok=True)
     return session_dir
 
 
@@ -67,6 +69,8 @@ class WorkspacePaths:
         self.database = base / "02_database"
         self.sparse = base / "03_sparse"
         self.masks = base / "04_masks"
+        self.object_masks = base / "05_object_masks"
+        self.object_dir = base / "06_object"
         self.database_file = self.database / "database.db"
 
     def ensure_dirs(self) -> None:
@@ -74,6 +78,8 @@ class WorkspacePaths:
         self.database.mkdir(parents=True, exist_ok=True)
         self.sparse.mkdir(parents=True, exist_ok=True)
         self.masks.mkdir(parents=True, exist_ok=True)
+        self.object_masks.mkdir(parents=True, exist_ok=True)
+        self.object_dir.mkdir(parents=True, exist_ok=True)
 
     def sparse_model_dir(self) -> Path:
         """Return the standard COLMAP sparse model subfolder sparse/0."""

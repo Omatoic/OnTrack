@@ -21,3 +21,13 @@ Thumbs.db
 .DS_Store
 .idea/
 .vscode/
+
+# Roto runtime artifacts
+roto/temp/
+roto/exports/
+roto/checkpoints
+roto/ontrack_roto.json
+roto/sammie_settings.conf
+roto/sammie_debug.log
+
+roto/.runtime_cache/

@@ -73,6 +73,7 @@ def generate_jsx(
     point_cloud: list[dict[str, Any]] | None = None,
     pixel_scale: float = 1000.0,
     sensor_width_mm: float = 36.0,
+    object_track: list[dict[str, Any]] | None = None,
 ) -> Path:
     """
     Generate an After Effects JSX script from a parsed camera track.
@@ -141,6 +142,25 @@ def generate_jsx(
     if point_cloud and "origin" in point_cloud[0]:
         origin = _to_ae_position(point_cloud[0]["origin"], pixel_scale)
 
+    # Build object null keyframes if available.
+    object_frames = []
+    if object_track:
+        for entry in object_track:
+            frame = entry["frame_number"]
+            pos = _to_ae_position(entry["position"], pixel_scale)
+            R = np.asarray(entry["orientation"], dtype=np.float64)
+            # Convert object world rotation to AE rotation the same way as the camera.
+            R_cw = np.asarray(list(zip(*R)), dtype=np.float64)
+            R_blender = R_cw @ _M_LOCAL_CAM
+            x, y, z = _matrix_to_euler_zyx(R_blender)
+            rot = [x - 90.0, -y, -z]
+            object_frames.append({"frame": int(frame) - frame_start, "pos": pos, "rot": rot})
+        # Unwrap rotations continuously.
+        for i in range(1, len(object_frames)):
+            prev = object_frames[i - 1]["rot"]
+            curr = object_frames[i]["rot"]
+            object_frames[i]["rot"] = [r + 360.0 * round((p - r) / 360.0) for r, p in zip(curr, prev)]
+
     comp_check = (
         f'var comp = app.project.itemByName({json.dumps(comp_name)});\n'
         if comp_name
@@ -191,6 +211,23 @@ def generate_jsx(
         posProp.setValueAtTime(t, pos);
         orientProp.setValueAtTime(t, o);
         zoomProp.setValueAtTime(t, correctZoom);
+    }}
+
+    // Tracked object null for replacement work.
+    var objectFrames = {_js_array(object_frames)};
+    if (objectFrames.length > 0) {{
+        var objNull = comp.layers.addNull();
+        objNull.threeDLayer = true;
+        objNull.name = "Tracked Object";
+        var objPosProp = objNull.property("Transform").property("Position");
+        var objOrientProp = objNull.property("Transform").property("Orientation");
+        for (var j = 0; j < objectFrames.length; j++) {{
+            var ot = objectFrames[j];
+            var objT = ot.frame * comp.frameDuration;
+            var objPos = [ot.pos[0] + halfW, ot.pos[1] + halfH, ot.pos[2]];
+            objPosProp.setValueAtTime(objT, objPos);
+            objOrientProp.setValueAtTime(objT, ot.rot);
+        }}
     }}
 
     app.endUndoGroup();

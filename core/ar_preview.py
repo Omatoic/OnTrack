@@ -140,12 +140,15 @@ class ARPreviewRenderer:
         frames_dir: Path,
         track: list[dict[str, Any]],
         point_cloud: list[dict[str, Any]] | None = None,
+        object_track: list[dict[str, Any]] | None = None,
     ) -> None:
         self.frames_dir = Path(frames_dir)
         self._original_track = track
         self.track = track
         self._original_point_cloud = _subsample_cloud(point_cloud or [])
         self.point_cloud = list(self._original_point_cloud)
+        self._original_object_track = object_track or []
+        self.object_track = list(self._original_object_track)
         self.object_type: str = "cube"
         self.object_size: float = 1.0
         self.object_position: tuple[float, float, float] = (0.0, 0.0, 2.0)
@@ -153,6 +156,8 @@ class ARPreviewRenderer:
         self._orientation_rotation: np.ndarray | None = None
         self._orientation_origin: np.ndarray | None = None
         self._z_rotation: float = 0.0  # Extra Z-axis rotation in degrees
+        self.error_threshold: float = 0.0  # 0 = no error coloring
+        self.min_track_len: int = 0        # points with shorter tracks are bad too
 
         # Caches to avoid recomputing every frame.
         self._frame_cache: dict[int, np.ndarray] = {}
@@ -256,6 +261,10 @@ class ARPreviewRenderer:
             R = self._z_rotation_matrix()
             self.track = apply_orientation_to_track(self._original_track, R, np.zeros(3))
             base_cloud = [{**p, "position": R @ np.asarray(p["position"])} for p in self._original_point_cloud]
+            base_obj = [
+                {**o, "position": (R @ np.asarray(o["position"])).tolist()}
+                for o in self._original_object_track
+            ]
         else:
             R = self._z_rotation_matrix() @ self._orientation_rotation
             self.track = apply_orientation_to_track(self._original_track, R, self._orientation_origin)
@@ -263,7 +272,15 @@ class ARPreviewRenderer:
                 {**p, "position": R @ (np.asarray(p["position"]) - self._orientation_origin)}
                 for p in self._original_point_cloud
             ]
+            base_obj = [
+                {
+                    **o,
+                    "position": (R @ (np.asarray(o["position"]) - self._orientation_origin)).tolist(),
+                }
+                for o in self._original_object_track
+            ]
         self.point_cloud = base_cloud
+        self.object_track = base_obj
 
     def set_orientation(self, rotation: np.ndarray, origin: np.ndarray) -> None:
         """Apply a known rotation/origin to the original (raw-frame) data."""
@@ -329,7 +346,42 @@ class ARPreviewRenderer:
         self._cloud_projection_cache.clear()
         self.track = self._original_track
         self.point_cloud = list(self._original_point_cloud)
+        self.object_track = list(self._original_object_track)
         self.object_position = self._original_object_position
+
+    def _draw_tracked_object(self, frame: np.ndarray, entry_index: int,
+                              camera_matrix: np.ndarray, rvec: np.ndarray, tvec: np.ndarray) -> None:
+        """Overlay the solved rigid object transform as a small axes/cube."""
+        if not self.object_track:
+            return
+        # Find the object frame matching this camera frame number.
+        cam_entry = self.track[entry_index]
+        cam_frame = cam_entry.get("frame_number", entry_index + 1)
+        obj_entry = next((o for o in self.object_track if o.get("frame_number") == cam_frame), None)
+        if obj_entry is None:
+            return
+        R_obj = np.asarray(obj_entry["orientation"], dtype=np.float64)
+        t_obj = np.asarray(obj_entry["position"], dtype=np.float64)
+
+        # Object-local small axes.
+        length = self.object_size * 0.2
+        local_pts = np.array([
+            [0, 0, 0],
+            [length, 0, 0],
+            [0, length, 0],
+            [0, 0, length],
+        ], dtype=np.float64)
+        world_pts = (R_obj @ local_pts.T).T + t_obj
+        projected, _ = cv2.projectPoints(world_pts, rvec, tvec, camera_matrix, None)
+        projected = projected.reshape(-1, 2)
+        if projected is None or len(projected) < 4:
+            return
+        origin = tuple(projected[0].astype(int))
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # X, Y, Z
+        for i, color in enumerate(colors, start=1):
+            pt = tuple(projected[i].astype(int))
+            cv2.line(frame, origin, pt, color, 2, cv2.LINE_AA)
+        cv2.circle(frame, origin, 4, (255, 255, 255), -1, cv2.LINE_AA)
 
     def render(self, entry_index: int) -> np.ndarray | None:
         """Return a BGR frame with the 3D object overlaid."""
@@ -367,6 +419,9 @@ class ARPreviewRenderer:
         if projected is None:
             return frame
 
+        # Draw solved object track axes.
+        self._draw_tracked_object(frame, entry_index, camera_matrix, rvec, t)
+
         edges = self._get_edges()
         # Draw point cloud.
         cloud_projected = self.project_point_cloud(entry_index)
@@ -375,6 +430,10 @@ class ARPreviewRenderer:
                 x, y = int(pt[0]), int(pt[1])
                 if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
                     color = p.get("color", (255, 255, 255))
+                    bad = (self.error_threshold > 0 and p.get("error", 0.0) > self.error_threshold) or \
+                          (self.min_track_len > 0 and len(p.get("track", [])) < self.min_track_len)
+                    if bad:
+                        color = (0, 0, 255)  # red = flagged bad
                     cv2.circle(frame, (x, y), 4, color, -1, cv2.LINE_AA)
                     cv2.circle(frame, (x, y), 4, (0, 0, 0), 1, cv2.LINE_AA)
 

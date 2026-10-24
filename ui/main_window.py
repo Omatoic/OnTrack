@@ -7,11 +7,12 @@ from typing import Any
 
 import numpy as np
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -40,12 +41,16 @@ from core.orientation import (
     resolve_floor_and_wall,
 )
 from core.parser import build_camera_track
+from core.smoothing import smooth_object_track, smooth_track
+from core.learned_features import learned_unavailable_reason
 from core.paths import clear_workspace, default_binary_paths, default_temp_root
 from core.pipeline import PipelineConfig, PipelineRunner
 from core.pointcloud import parse_points3d_txt
 from core.project import load_project, save_project
 from core.video_info import probe_video
 from ui.ar_preview_widget import ARPreviewWidget
+from ui.dependencies_widget import DependenciesWidget, missing_dependencies
+from ui.roto_widget import RotoWidget
 from ui.undistort_widget import UndistortWidget
 from ui.style import apply as apply_stylesheet
 from ui.video_preview_widget import VideoPreviewWidget
@@ -54,7 +59,7 @@ from ui.video_preview_widget import VideoPreviewWidget
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("OnTrack — Camera Tracker")
+        self.setWindowTitle("OnTrack")
         self.resize(1100, 750)
         self.setAcceptDrops(True)
 
@@ -66,9 +71,12 @@ class MainWindow(QMainWindow):
         self._raw_track: list[dict[str, Any]] | None = None
         self._raw_track_colmap: list[dict[str, Any]] | None = None
         self._oriented_track: list[dict[str, Any]] | None = None
+        self._object_track: list[dict[str, Any]] | None = None
         self._point_cloud: list[dict[str, Any]] | None = None
         self._frames_dir: Path | None = None
         self._orientation: dict[str, Any] | None = None
+        self._last_config: PipelineConfig | None = None
+        self._smoothing_window: int = 0
         self._scale: float = 1.0
         self._z_rotation: float = 0.0
         self._project_dir: Path | None = None
@@ -85,8 +93,13 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(12)
         root_layout.setContentsMargins(16, 16, 16, 16)
 
+        # --- Menubar ---
+        settings_menu = self.menuBar().addMenu("&Settings")
+        settings_menu.addAction("Tracking Settings…", lambda: self._show_advanced(0))
+        settings_menu.addAction("Dependencies…", lambda: self._show_advanced(1))
+
         # --- Header ---
-        header = QLabel("GLOMAP 3D Camera Tracker")
+        header = QLabel("OnTrack")
         header.setStyleSheet("font-size: 18px; font-weight: bold; color: #f0f0f0;")
         root_layout.addWidget(header)
 
@@ -197,21 +210,25 @@ class MainWindow(QMainWindow):
         out_group = QGroupBox("Output")
         out_layout = QVBoxLayout(out_group)
         self._out_path = self._file_row(out_layout, "Output folder:", "Browse", self._pick_output, directory=True)
-        self._matte_path = self._file_row(out_layout, "Ignore matte (optional):", "Browse", self._pick_matte)
+        self._matte_src = self._mask_source_combo("ignore")
+        self._matte_path = self._file_row(
+            out_layout, "Ignore matte (optional):", "Browse", self._pick_matte, extra=self._matte_src
+        )
         self._matte_path.setPlaceholderText(
             "Black/white matte video matching the frame count — white regions are ignored"
         )
+        self._objmask_src = self._mask_source_combo("object")
+        self._object_mask_path = self._file_row(
+            out_layout, "Object mask (object track):", "Browse", self._pick_object_mask, extra=self._objmask_src
+        )
+        self._object_mask_path.setPlaceholderText(
+            "White/alpha mask video isolating the moving object — required for Object Track mode"
+        )
+        self._object_mask_path.setEnabled(False)
+        self._objmask_src.setEnabled(False)
         track_right.addWidget(out_group)
 
-        # Binaries
-        bin_group = QGroupBox("Binaries (auto-detected)")
-        bin_layout = QVBoxLayout(bin_group)
-        self._ffmpeg_path = self._file_row(bin_layout, "FFmpeg:", "Browse", self._pick_ffmpeg)
-        self._colmap_path = self._file_row(bin_layout, "COLMAP:", "Browse", self._pick_colmap)
-        self._glomap_path = self._file_row(bin_layout, "GLOMAP:", "Browse", self._pick_glomap)
-        track_right.addWidget(bin_group)
-
-        # Settings
+        # Settings (essentials only — advanced options live in the Settings menu)
         settings_group = QGroupBox("Settings")
         settings_layout = QHBoxLayout(settings_group)
 
@@ -221,47 +238,36 @@ class MainWindow(QMainWindow):
         self._fps_spin.setValue(24)
         settings_layout.addWidget(self._fps_spin)
 
-        settings_layout.addWidget(QLabel("Max size (px):"))
-        self._max_size_spin = QSpinBox()
-        self._max_size_spin.setRange(0, 8192)
-        self._max_size_spin.setValue(0)
-        self._max_size_spin.setSpecialValueText("None")
-        self._max_size_spin.setToolTip("Default is full resolution, matching the reference batch workflow.")
-        settings_layout.addWidget(self._max_size_spin)
-
         settings_layout.addWidget(QLabel("Frame skip:"))
         self._frame_skip_spin = QSpinBox()
         self._frame_skip_spin.setRange(0, 100)
         self._frame_skip_spin.setValue(0)
         settings_layout.addWidget(self._frame_skip_spin)
 
-        settings_layout.addWidget(QLabel("Matte shrink (px):"))
-        self._matte_shrink_spin = QSpinBox()
-        self._matte_shrink_spin.setRange(0, 200)
-        self._matte_shrink_spin.setValue(0)
-        self._matte_shrink_spin.setToolTip(
-            "Shrink the ignored (white) matte region by this many pixels. Use to offset"
-            " COLMAP dropping features near the mask boundary."
+        settings_layout.addWidget(QLabel("Track type:"))
+        self._track_type_combo = QComboBox()
+        self._track_type_combo.addItem("Classic (SIFT)", "sift")
+        self._track_type_combo.addItem("Learned (SuperPoint + LightGlue)", "learned")
+        self._track_type_combo.addItem("Object Track", "object")
+        self._track_type_combo.setToolTip(
+            "Classic: COLMAP SIFT features, best for sharp, textured footage.\n"
+            "Learned: neural features on the GPU (DirectML), more robust on blurry or low-texture shots,"
+            " but slower and with slightly lower sub-pixel precision.\n"
+            "Object Track: solves a rigid moving object using an object mask, after the camera is tracked."
         )
-        settings_layout.addWidget(self._matte_shrink_spin)
+        self._track_type_combo.currentIndexChanged.connect(self._on_track_type_changed)
+        settings_layout.addWidget(self._track_type_combo)
 
-        settings_layout.addWidget(QLabel("Matcher:"))
-        self._matcher_combo = QComboBox()
-        self._matcher_combo.addItems(["sequential", "exhaustive"])
-        self._matcher_combo.setToolTip(
-            "Sequential is recommended for video. Exhaustive compares every frame against every other frame."
-        )
-        settings_layout.addWidget(self._matcher_combo)
-
-        self._cleanup_check = QCheckBox("Clean workspace on exit")
-        settings_layout.addWidget(self._cleanup_check)
+        advanced_btn = QPushButton("Advanced…")
+        advanced_btn.clicked.connect(lambda: self._show_advanced(0))
+        settings_layout.addWidget(advanced_btn)
         settings_layout.addStretch()
 
-        self._gpu_check = QCheckBox("Use GPU for SIFT")
-        self._gpu_check.setToolTip("Use the GPU for feature extraction/matching. The reference workflow uses CPU.")
-        settings_layout.addWidget(self._gpu_check)
-
         track_right.addWidget(settings_group)
+
+        # Advanced settings live in a dialog so the tab stays clean. The
+        # widgets are created up front because _set_defaults() fills them.
+        self._build_advanced_dialog()
 
         # Run
         run_layout = QHBoxLayout()
@@ -296,6 +302,17 @@ class MainWindow(QMainWindow):
 
         self._tabs.addTab(track_tab, "Track")
 
+        # Roto tab
+        self._roto = RotoWidget(
+            ffmpeg_getter=lambda: self._ffmpeg_path.text(),
+            fps_getter=lambda: self._video_info.get("fps") or float(self._fps_spin.value()),
+            video_getter=lambda: self._video_file,
+        )
+        self._roto.objects_changed.connect(self._refresh_mask_combos)
+        self._roto.matte_ready.connect(self._on_matte_ready)
+        self._roto.status_message.connect(self._log.append)
+        self._tabs.insertTab(0, self._roto, "Roto")
+
         # Preview tab
         preview_tab = QWidget()
         preview_layout = QVBoxLayout(preview_tab)
@@ -305,13 +322,15 @@ class MainWindow(QMainWindow):
         self._ar_preview.origin_set.connect(self._on_ar_origin_set)
         self._ar_preview.scale_applied.connect(self._on_ar_scale_applied)
         self._ar_preview.z_rotation_changed.connect(self._on_ar_z_rotation_changed)
+        self._ar_preview.resolve_requested.connect(self._on_resolve_requested)
+        self._ar_preview.smoothing_changed.connect(self._on_smoothing_changed)
         preview_layout.addWidget(self._ar_preview)
         self._tabs.addTab(preview_tab, "Preview")
 
         # Undistort tab
         undistort_tab = UndistortWidget(
             ffmpeg_path_getter=lambda: self._ffmpeg_path.text())
-        self._tabs.insertTab(0, undistort_tab, "Undistort")
+        self._tabs.insertTab(1, undistort_tab, "Undistort")
 
         # Export tab
         export_tab = QWidget()
@@ -338,6 +357,111 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self._tabs, 1)
         root_layout.addLayout(main_layout, 1)
 
+    def _build_advanced_dialog(self) -> None:
+        """Settings dialog: 'Tracking' page for tuning knobs and a
+        'Dependencies' page for binaries + downloadable models."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.setMinimumSize(720, 560)
+        layout = QVBoxLayout(dlg)
+
+        tabs = QTabWidget(dlg)
+
+        # ---- Tracking page ----
+        tracking_page = QWidget()
+        page = QVBoxLayout(tracking_page)
+
+        tune_group = QGroupBox("Tracking Tuning")
+        form = QFormLayout(tune_group)
+
+        self._max_size_spin = QSpinBox()
+        self._max_size_spin.setRange(0, 8192)
+        self._max_size_spin.setValue(0)
+        self._max_size_spin.setSpecialValueText("None")
+        self._max_size_spin.setToolTip(
+            "Default is full resolution, matching the reference batch workflow.\n"
+            "4K+ footage: set ~1920 for a much faster, more stable CPU SIFT extraction."
+        )
+        form.addRow("Max frame size (px):", self._max_size_spin)
+
+        self._matcher_combo = QComboBox()
+        self._matcher_combo.addItems(["sequential", "exhaustive"])
+        self._matcher_combo.setToolTip(
+            "Sequential is recommended for video. Exhaustive compares every frame against every other frame."
+        )
+        form.addRow("Matcher:", self._matcher_combo)
+
+        self._matte_shrink_spin = QSpinBox()
+        self._matte_shrink_spin.setRange(-200, 200)
+        self._matte_shrink_spin.setValue(0)
+        self._matte_shrink_spin.setToolTip(
+            "Positive values grow the ignored matte (~1px per step), negative values shrink it."
+            " Subject-edge features often need +10 to +30 to fully exclude the silhouette."
+        )
+        form.addRow("Matte grow/shrink (px):", self._matte_shrink_spin)
+        page.addWidget(tune_group)
+
+        opts_group = QGroupBox("Options")
+        opts = QVBoxLayout(opts_group)
+        self._gpu_check = QCheckBox("Use GPU for SIFT")
+        self._gpu_check.setToolTip("Use the GPU for feature extraction/matching. The reference workflow uses CPU.")
+        opts.addWidget(self._gpu_check)
+        self._cleanup_check = QCheckBox("Clean workspace on exit")
+        opts.addWidget(self._cleanup_check)
+        page.addWidget(opts_group)
+        page.addStretch()
+        tabs.addTab(tracking_page, "Tracking")
+
+        # ---- Dependencies page ----
+        deps_page = QWidget()
+        deps_layout = QVBoxLayout(deps_page)
+        bin_group = QGroupBox("Binaries (auto-detected)")
+        bin_layout = QVBoxLayout(bin_group)
+        self._ffmpeg_path = self._file_row(bin_layout, "FFmpeg:", "Browse", self._pick_ffmpeg)
+        self._colmap_path = self._file_row(bin_layout, "COLMAP:", "Browse", self._pick_colmap)
+        self._glomap_path = self._file_row(bin_layout, "GLOMAP:", "Browse", self._pick_glomap)
+        deps_layout.addWidget(bin_group)
+        self._deps_widget = DependenciesWidget()
+        deps_layout.addWidget(self._deps_widget, 1)
+        tabs.addTab(deps_page, "Dependencies")
+
+        layout.addWidget(tabs, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._settings_tabs = tabs
+        self._advanced_dlg = dlg
+
+    def _show_advanced(self, tab: int = 0) -> None:
+        self._settings_tabs.setCurrentIndex(tab)
+        self._deps_widget.refresh()
+        self._advanced_dlg.exec()
+
+    def _check_dependencies_first_run(self) -> None:
+        missing = missing_dependencies({
+            "FFmpeg": self._ffmpeg_path.text(),
+            "COLMAP": self._colmap_path.text(),
+            "GLOMAP": self._glomap_path.text(),
+        })
+        if not missing:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Missing dependencies",
+            "Some dependencies aren't set up yet:\n\n• "
+            + "\n• ".join(missing)
+            + "\n\nOpen the Dependencies manager to review and install them?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._show_advanced(1)
+
     def _file_row(
         self,
         parent_layout: QVBoxLayout,
@@ -345,17 +469,91 @@ class MainWindow(QMainWindow):
         button_text: str,
         callback,
         directory: bool = False,
+        extra: QWidget | None = None,
     ) -> QLineEdit:
         row = QHBoxLayout()
         row.addWidget(QLabel(label))
         edit = QLineEdit()
         edit.setMinimumWidth(300)
         row.addWidget(edit, 1)
+        if extra is not None:
+            row.addWidget(extra)
         btn = QPushButton(button_text)
         btn.clicked.connect(lambda: callback(edit))
         row.addWidget(btn)
         parent_layout.addLayout(row)
         return edit
+
+    # ---- Roto mask sources ----
+
+    def _mask_source_combo(self, role: str) -> QComboBox:
+        combo = QComboBox()
+        combo.setMinimumWidth(170)
+        combo.setToolTip(
+            "Pick a mask made in the Roto tab, or 'Create new mask' to open the roto editor."
+        )
+        combo.currentIndexChanged.connect(lambda _i, c=combo, r=role: self._on_mask_source(r, c))
+        self._populate_mask_combo(combo)
+        return combo
+
+    def _populate_mask_combo(self, combo: QComboBox) -> None:
+        combo.blockSignals(True)
+        current = combo.currentData()
+        combo.clear()
+        combo.addItem("File / none", None)
+        for obj in self._roto_objects():
+            label = f"Roto: {obj.name} ({obj.frame_count}f)"
+            combo.addItem(label, ("roto", obj.object_id))
+        if self._roto_objects():
+            combo.addItem("Roto: All objects", ("roto", "all"))
+        combo.addItem("+ Create new mask…", ("new",))
+        idx = combo.findData(current)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _roto_objects(self):
+        return self._roto.objects() if hasattr(self, "_roto") else []
+
+    def _refresh_mask_combos(self) -> None:
+        self._populate_mask_combo(self._matte_src)
+        self._populate_mask_combo(self._objmask_src)
+        if self._roto_objects():
+            self._log.append("Roto masks detected — select them via the mask dropdowns in the Track tab.")
+
+    def _on_mask_source(self, role: str, combo: QComboBox) -> None:
+        data = combo.currentData()
+        if not data:
+            return
+        if data[0] == "new":
+            video = self._video_file
+            if video is None:
+                QMessageBox.information(self, "No video", "Load a video first, then create a mask.")
+            else:
+                self._tabs.setCurrentWidget(self._roto)
+                self._roto.open_editor(video)
+                self._log.append("Video sent to the Roto tab — masks will appear in these dropdowns.")
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+            return
+        if data[0] == "roto":
+            object_ids = None if data[1] == "all" else [int(data[1])]
+            if not self._roto.request_matte(role, object_ids):
+                combo.blockSignals(True)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+
+    def _on_matte_ready(self, path: str, role: str) -> None:
+        if role not in ("ignore", "object"):
+            self._log.append(f"Roto matte exported: {path}")
+            return
+        target = self._matte_path if role == "ignore" else self._object_mask_path
+        combo = self._matte_src if role == "ignore" else self._objmask_src
+        target.setText(path)
+        self._log.append(f"Roto matte ready for {'ignore matte' if role == 'ignore' else 'object mask'}: {path}")
+        combo.blockSignals(True)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
 
     def _set_defaults(self) -> None:
         bins = default_binary_paths()
@@ -363,6 +561,7 @@ class MainWindow(QMainWindow):
         self._colmap_path.setText(str(bins["colmap"]))
         self._glomap_path.setText(str(bins["glomap"]))
         self._out_path.setText(str(default_temp_root()))
+        QTimer.singleShot(800, self._check_dependencies_first_run)
 
     # ---- Pickers ----
 
@@ -382,6 +581,16 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Ignore Matte",
+            "",
+            "Videos/Images (*.mp4 *.mov *.avi *.mkv *.png *.jpg);;All files (*.*)",
+        )
+        if path:
+            edit.setText(path)
+
+    def _pick_object_mask(self, edit: QLineEdit) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Object Mask",
             "",
             "Videos/Images (*.mp4 *.mov *.avi *.mkv *.png *.jpg);;All files (*.*)",
         )
@@ -479,6 +688,15 @@ class MainWindow(QMainWindow):
 
     # ---- Tracking ----
 
+    def _on_track_type_changed(self) -> None:
+        is_sift = self._track_type_combo.currentData() == "sift"
+        is_object = self._track_type_combo.currentData() == "object"
+        self._gpu_check.setEnabled(is_sift)
+        self._object_mask_path.setEnabled(is_object)
+        self._objmask_src.setEnabled(is_object)
+        if not is_object:
+            self._object_mask_path.clear()
+
     def _run_tracking(self) -> None:
         if not self._video_file or not self._video_file.exists():
             QMessageBox.warning(self, "Missing input", "Please select a valid input video.")
@@ -489,6 +707,22 @@ class MainWindow(QMainWindow):
                            ("GLOMAP", self._glomap_path.text())]:
             if not Path(path).exists():
                 QMessageBox.warning(self, "Missing binary", f"{name} binary not found: {path}")
+                return
+
+        if self._track_type_combo.currentData() == "learned":
+            reason = learned_unavailable_reason()
+            if reason:
+                QMessageBox.warning(self, "Learned tracking unavailable", reason)
+                return
+
+        if self._track_type_combo.currentData() == "object":
+            reason = learned_unavailable_reason()
+            if reason:
+                QMessageBox.warning(self, "Object tracking unavailable", reason)
+                return
+            mask_text = self._object_mask_path.text().strip()
+            if not mask_text or not Path(mask_text).exists():
+                QMessageBox.warning(self, "Missing object mask", "Object Track mode requires a valid object mask video.")
                 return
 
         self._log.clear()
@@ -505,11 +739,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing matte", f"Matte file not found: {mask_video}")
             return
 
+        obj_mask_text = self._object_mask_path.text().strip()
+        object_mask_video = Path(obj_mask_text) if obj_mask_text else None
+        if self._track_type_combo.currentData() == "object" and (object_mask_video is None or not object_mask_video.exists()):
+            QMessageBox.warning(self, "Missing object mask", "Object Track mode requires a valid object mask video.")
+            return
+
         config = PipelineConfig(
             input_video=self._video_file,
             output_dir=Path(self._out_path.text()),
             mask_video=mask_video,
-            mask_shrink=self._matte_shrink_spin.value(),
+            object_mask_video=object_mask_video,
+            object_primitive="box",
+            object_size=(1.0, 1.0, 1.0),
+            mask_grow=self._matte_shrink_spin.value(),
             ffmpeg=Path(self._ffmpeg_path.text()),
             colmap=Path(self._colmap_path.text()),
             glomap=Path(self._glomap_path.text()),
@@ -518,9 +761,11 @@ class MainWindow(QMainWindow):
             frame_skip=self._frame_skip_spin.value(),
             matcher_type=self._matcher_combo.currentText(),
             use_gpu=self._gpu_check.isChecked(),
+            feature_mode=self._track_type_combo.currentData(),
         )
 
         self._fps = config.fps
+        self._last_config = config
         self._runner = PipelineRunner(config)
         self._runner.log.connect(self._on_log)
         self._runner.progress.connect(self._on_progress)
@@ -553,8 +798,26 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Tracking failed", message)
 
     def _on_export_ready(self, sparse_dir: str) -> None:
-        self._sparse_dir = Path(sparse_dir)
+        try:
+            self._handle_export_ready(Path(sparse_dir))
+        except Exception as exc:
+            self._log.append(f"Post-processing failed: {exc}")
+
+    def _handle_export_ready(self, sparse_dir: Path) -> None:
+        self._sparse_dir = sparse_dir
         self._log.append(f"Sparse model ready: {sparse_dir}")
+
+        # Load object track if it exists.
+        object_track_path = self._sparse_dir.parent.parent / "06_object" / "object_track.json"
+        if object_track_path.exists():
+            try:
+                import json
+                with open(object_track_path) as f:
+                    self._object_track = json.load(f)
+                self._log.append(f"Loaded {len(self._object_track)} object track frames.")
+            except Exception as exc:
+                self._log.append(f"Could not load object track: {exc}")
+                self._object_track = None
 
         cameras_txt = self._sparse_dir / "cameras.txt"
         images_txt = self._sparse_dir / "images.txt"
@@ -576,7 +839,8 @@ class MainWindow(QMainWindow):
             self._point_cloud = parse_points3d_txt(points3d_txt) if points3d_txt.exists() else []
             try:
                 self._ar_preview.load_track(
-                    self._frames_dir, self._raw_track_colmap, self._point_cloud, z_rotation=self._z_rotation
+                    self._frames_dir, self._raw_track_colmap, self._point_cloud,
+                    z_rotation=self._z_rotation, object_track=self._object_track
                 )
                 self._log.append(f"AR preview ready ({len(self._point_cloud)} point-cloud points).")
             except Exception as exc:
@@ -595,6 +859,11 @@ class MainWindow(QMainWindow):
         if not track:
             QMessageBox.warning(self, "No track", "Run tracking first.")
             return
+        object_track = self._object_track
+        if self._smoothing_window >= 3:
+            track = smooth_track(track, self._smoothing_window)
+            if object_track:
+                object_track = smooth_object_track(object_track, self._smoothing_window)
 
         cloud = self._point_cloud or []
         if self._orientation is not None:
@@ -616,7 +885,7 @@ class MainWindow(QMainWindow):
                     self, "Save After Effects Script", "GLOMAP_Camera_Track.jsx", "JSX (*.jsx)"
                 )
                 if path:
-                    generate_ae_jsx(track, self._fps, Path(path), point_cloud=cloud)
+                    generate_ae_jsx(track, self._fps, Path(path), point_cloud=cloud, object_track=object_track)
                     self._log.append(f"Exported AE script: {path}")
             else:
                 path, _ = QFileDialog.getSaveFileName(
@@ -629,6 +898,7 @@ class MainWindow(QMainWindow):
                         Path(path),
                         point_cloud=cloud,
                         world_space="blender" if self._oriented_track is not None else "glomap",
+                        object_track=object_track,
                     )
                     self._log.append(f"Exported Blender script: {path}")
         except Exception as exc:
@@ -645,6 +915,68 @@ class MainWindow(QMainWindow):
         has_track = bool(self._raw_track or self._oriented_track)
         self._export_ae_btn.setEnabled(has_track)
         self._export_blender_btn.setEnabled(has_track)
+
+    def _on_resolve_requested(self, bad_ids: list[int]) -> None:
+        """Prune the given points3D ids and re-run GLOMAP on the same workspace."""
+        if self._last_config is None or self._workspace_dir is None:
+            QMessageBox.warning(self, "Cannot re-solve", "Run a full track first.")
+            return
+        if not bad_ids:
+            QMessageBox.information(self, "Nothing to prune", "No points exceed the threshold.")
+            return
+        if self._runner is not None and self._runner.is_running():
+            QMessageBox.warning(self, "Busy", "A tracking run is already in progress.")
+            return
+
+        try:
+            from dataclasses import replace
+            config = replace(
+                self._last_config,
+                resolve_only=True,
+                prune_point_ids=list(map(int, bad_ids)),
+                resume_workspace=Path(self._workspace_dir),
+            )
+            self._run_btn.setEnabled(False)
+            self._cancel_btn.setEnabled(True)
+            self._log.append(f"Re-solve requested: pruning {len(bad_ids)} points...")
+            self._runner = PipelineRunner(config)
+            self._runner.log.connect(self._on_log)
+            self._runner.progress.connect(self._on_progress)
+            self._runner.finished.connect(self._on_finished)
+            self._runner.export_ready.connect(self._on_export_ready)
+            self._runner.start()
+        except Exception as exc:
+            self._run_btn.setEnabled(True)
+            self._cancel_btn.setEnabled(False)
+            self._log.append(f"Re-solve failed to start: {exc}")
+            QMessageBox.critical(self, "Re-solve failed", str(exc))
+
+    def _on_smoothing_changed(self) -> None:
+        """Re-load the preview and exports with Savitzky-Golay smoothed poses."""
+        self._smoothing_window = int(self._ar_preview._smooth_window.value())
+        if self._raw_track_colmap is None or self._frames_dir is None:
+            return
+        orientation = None
+        if self._orientation is not None:
+            orientation = (
+                np.asarray(self._orientation["rotation"]),
+                np.asarray(self._orientation["origin"]),
+            )
+        track = self._raw_track_colmap
+        obj = self._object_track
+        if self._smoothing_window >= 3:
+            track = smooth_track(track, self._smoothing_window)
+            if obj:
+                obj = smooth_object_track(obj, self._smoothing_window)
+        self._ar_preview.load_track(
+            self._frames_dir, track, self._point_cloud, orientation,
+            z_rotation=self._z_rotation, object_track=obj,
+        )
+        if self._smoothing_window >= 3:
+            self._log.append(f"Temporal smoothing applied (window {self._smoothing_window} frames).")
+        else:
+            self._log.append("Temporal smoothing disabled.")
+        self._dirty = True
 
     def _on_ar_orientation_applied(
         self,
@@ -758,6 +1090,10 @@ class MainWindow(QMainWindow):
             "max_size": self._max_size_spin.value(),
             "frame_skip": self._frame_skip_spin.value(),
             "matcher": self._matcher_combo.currentText(),
+            "track_type": self._track_type_combo.currentData(),
+            "mask_path": self._matte_path.text(),
+            "object_mask_path": self._object_mask_path.text(),
+            "smoothing_window": self._smoothing_window,
             "use_gpu": self._gpu_check.isChecked(),
             "binary_paths": {
                 "ffmpeg": self._ffmpeg_path.text(),
@@ -836,6 +1172,12 @@ class MainWindow(QMainWindow):
         self._max_size_spin.setValue(settings.get("max_size", 0))
         self._frame_skip_spin.setValue(settings.get("frame_skip", 0))
         self._matcher_combo.setCurrentText(settings.get("matcher", "sequential"))
+        self._track_type_combo.setCurrentIndex(max(0, self._track_type_combo.findData(settings.get("track_type", "sift"))))
+        self._on_track_type_changed()
+        self._object_mask_path.setText(settings.get("object_mask_path", ""))
+        self._matte_path.setText(settings.get("mask_path", ""))
+        self._ar_preview._smooth_window.setValue(settings.get("smoothing_window", 0))
+        self._smoothing_window = settings.get("smoothing_window", 0)
         self._gpu_check.setChecked(settings.get("use_gpu", False))
         if "binary_paths" in settings:
             self._ffmpeg_path.setText(settings["binary_paths"].get("ffmpeg", ""))
@@ -873,6 +1215,7 @@ class MainWindow(QMainWindow):
                 self._point_cloud,
                 orientation,
                 z_rotation=self._z_rotation,
+                object_track=self._object_track,
             )
 
         self._save_project_btn.setEnabled(True)
@@ -882,6 +1225,10 @@ class MainWindow(QMainWindow):
         self._log.append(f"Project loaded from: {project_file_str}")
 
     def closeEvent(self, event) -> None:
+        try:
+            self._roto.shutdown()
+        except Exception:
+            pass
         if self._dirty and self._raw_track:
             answer = QMessageBox.question(
                 self,
@@ -898,6 +1245,9 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.StandardButton.Save and not self._save_project():
                 event.ignore()
                 return
+        if self._runner is not None and self._runner.is_running():
+            self._runner.cancel()
+            self._runner.wait(10000)
         if self._cleanup_check.isChecked() and self._runner and self._runner.workspace:
             try:
                 clear_workspace(self._runner.workspace.base)
