@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,13 +44,20 @@ from core.orientation import (
 from core.parser import build_camera_track
 from core.smoothing import smooth_object_track, smooth_track
 from core.learned_features import learned_unavailable_reason
-from core.paths import clear_workspace, default_binary_paths, default_temp_root
+from core.paths import (
+    clear_workspace,
+    default_binary_paths,
+    is_temp_path,
+    purge_stale_temp,
+    session_temp_root,
+)
 from core.pipeline import PipelineConfig, PipelineRunner
 from core.pointcloud import parse_points3d_txt
 from core.project import load_project, save_project
 from core.video_info import probe_video
 from ui.ar_preview_widget import ARPreviewWidget
-from ui.dependencies_widget import DependenciesWidget, missing_dependencies
+from ui.dependencies_widget import DependenciesWidget, missing_downloads
+from ui.file_dialogs import install as install_file_dialog_memory
 from ui.roto_widget import RotoWidget
 from ui.undistort_widget import UndistortWidget
 from ui.style import apply as apply_stylesheet
@@ -80,11 +88,26 @@ class MainWindow(QMainWindow):
         self._scale: float = 1.0
         self._z_rotation: float = 0.0
         self._project_dir: Path | None = None
+        self._project_file: Path | None = None
         self._dirty = False
         self._workspace_dir: Path | None = None
+        # Scratch workspaces/mattes this instance created in the OS temp dir;
+        # deleted when superseded and on exit.
+        self._temp_workspaces: list[Path] = []
+        self._temp_mattes: set[Path] = set()
+        self._pending_mask_role: str | None = None   # set by "Create new mask…"
 
+        purge_stale_temp()
         self._build_ui()
         self._set_defaults()
+        for edit in self.findChildren(QLineEdit):
+            edit.textChanged.connect(lambda *_: setattr(self, "_dirty", True))
+        for combo in self.findChildren(QComboBox):
+            combo.currentIndexChanged.connect(lambda *_: setattr(self, "_dirty", True))
+        for spin in self.findChildren(QSpinBox):
+            spin.valueChanged.connect(lambda *_: setattr(self, "_dirty", True))
+        for check in self.findChildren(QCheckBox):
+            check.toggled.connect(lambda *_: setattr(self, "_dirty", True))
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -94,6 +117,10 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(16, 16, 16, 16)
 
         # --- Menubar ---
+        file_menu = self.menuBar().addMenu("&File")
+        file_menu.addAction("Open Project…", self._load_project).setShortcut("Ctrl+O")
+        file_menu.addAction("Save", lambda: self._save_project(False)).setShortcut("Ctrl+S")
+        file_menu.addAction("Save As…", lambda: self._save_project(True)).setShortcut("Ctrl+Shift+S")
         settings_menu = self.menuBar().addMenu("&Settings")
         settings_menu.addAction("Tracking Settings…", lambda: self._show_advanced(0))
         settings_menu.addAction("Dependencies…", lambda: self._show_advanced(1))
@@ -168,13 +195,13 @@ class MainWindow(QMainWindow):
 
         self._save_project_btn = QPushButton("Save Project")
         self._save_project_btn.setMinimumHeight(42)
-        self._save_project_btn.setEnabled(False)
+        self._save_project_btn.setEnabled(True)
         self._save_project_btn.clicked.connect(lambda: self._save_project(save_as=False))
         btn_layout.addWidget(self._save_project_btn)
 
         self._save_as_btn = QPushButton("Save Project As...")
         self._save_as_btn.setMinimumHeight(42)
-        self._save_as_btn.setEnabled(False)
+        self._save_as_btn.setEnabled(True)
         self._save_as_btn.clicked.connect(lambda: self._save_project(save_as=True))
         btn_layout.addWidget(self._save_as_btn)
 
@@ -210,6 +237,13 @@ class MainWindow(QMainWindow):
         out_group = QGroupBox("Output")
         out_layout = QVBoxLayout(out_group)
         self._out_path = self._file_row(out_layout, "Output folder:", "Browse", self._pick_output, directory=True)
+        self._out_path.setPlaceholderText(
+            "Temporary — cleared on exit unless you Save Project"
+        )
+        self._out_path.setToolTip(
+            f"Leave empty to work in {session_temp_root()} (deleted on exit; Save Project keeps the results).\n"
+            "Choose a folder to keep every run's workspace there permanently."
+        )
         self._matte_src = self._mask_source_combo("ignore")
         self._matte_path = self._file_row(
             out_layout, "Ignore matte (optional):", "Browse", self._pick_matte, extra=self._matte_src
@@ -226,6 +260,19 @@ class MainWindow(QMainWindow):
         )
         self._object_mask_path.setEnabled(False)
         self._objmask_src.setEnabled(False)
+
+        grow_row = QHBoxLayout()
+        grow_row.addWidget(QLabel("Matte grow/shrink (px):"))
+        self._matte_shrink_spin = QSpinBox()
+        self._matte_shrink_spin.setRange(-200, 200)
+        self._matte_shrink_spin.setValue(0)
+        self._matte_shrink_spin.setToolTip(
+            "Positive values grow the ignored matte (~1px per step), negative values shrink it."
+            " Subject-edge features often need +10 to +30 to fully exclude the silhouette."
+        )
+        grow_row.addWidget(self._matte_shrink_spin)
+        grow_row.addStretch()
+        out_layout.addLayout(grow_row)
         track_right.addWidget(out_group)
 
         # Settings (essentials only — advanced options live in the Settings menu)
@@ -301,6 +348,7 @@ class MainWindow(QMainWindow):
         track_layout.addLayout(track_right, 1)
 
         self._tabs.addTab(track_tab, "Track")
+        self._track_tab = track_tab
 
         # Roto tab
         self._roto = RotoWidget(
@@ -309,6 +357,8 @@ class MainWindow(QMainWindow):
             video_getter=lambda: self._video_file,
         )
         self._roto.objects_changed.connect(self._refresh_mask_combos)
+        self._roto.objects_changed.connect(lambda: setattr(self, "_dirty", True))
+        self._roto.session_changed.connect(lambda: setattr(self, "_dirty", True))
         self._roto.matte_ready.connect(self._on_matte_ready)
         self._roto.status_message.connect(self._log.append)
         self._tabs.insertTab(0, self._roto, "Roto")
@@ -330,6 +380,7 @@ class MainWindow(QMainWindow):
         # Undistort tab
         undistort_tab = UndistortWidget(
             ffmpeg_path_getter=lambda: self._ffmpeg_path.text())
+        self._undistort = undistort_tab
         self._tabs.insertTab(1, undistort_tab, "Undistort")
 
         # Export tab
@@ -354,6 +405,7 @@ class MainWindow(QMainWindow):
         export_layout.addStretch()
         self._tabs.addTab(export_tab, "Export")
 
+        self._tabs.currentChanged.connect(self._on_tab_changed)
         main_layout.addWidget(self._tabs, 1)
         root_layout.addLayout(main_layout, 1)
 
@@ -390,15 +442,6 @@ class MainWindow(QMainWindow):
             "Sequential is recommended for video. Exhaustive compares every frame against every other frame."
         )
         form.addRow("Matcher:", self._matcher_combo)
-
-        self._matte_shrink_spin = QSpinBox()
-        self._matte_shrink_spin.setRange(-200, 200)
-        self._matte_shrink_spin.setValue(0)
-        self._matte_shrink_spin.setToolTip(
-            "Positive values grow the ignored matte (~1px per step), negative values shrink it."
-            " Subject-edge features often need +10 to +30 to fully exclude the silhouette."
-        )
-        form.addRow("Matte grow/shrink (px):", self._matte_shrink_spin)
         page.addWidget(tune_group)
 
         opts_group = QGroupBox("Options")
@@ -406,8 +449,6 @@ class MainWindow(QMainWindow):
         self._gpu_check = QCheckBox("Use GPU for SIFT")
         self._gpu_check.setToolTip("Use the GPU for feature extraction/matching. The reference workflow uses CPU.")
         opts.addWidget(self._gpu_check)
-        self._cleanup_check = QCheckBox("Clean workspace on exit")
-        opts.addWidget(self._cleanup_check)
         page.addWidget(opts_group)
         page.addStretch()
         tabs.addTab(tracking_page, "Tracking")
@@ -421,7 +462,8 @@ class MainWindow(QMainWindow):
         self._colmap_path = self._file_row(bin_layout, "COLMAP:", "Browse", self._pick_colmap)
         self._glomap_path = self._file_row(bin_layout, "GLOMAP:", "Browse", self._pick_glomap)
         deps_layout.addWidget(bin_group)
-        self._deps_widget = DependenciesWidget()
+        self._deps_widget = DependenciesWidget(binary_paths_getter=self._configured_binaries)
+        self._deps_widget.binaries_installed.connect(self._on_binaries_installed)
         deps_layout.addWidget(self._deps_widget, 1)
         tabs.addTab(deps_page, "Dependencies")
 
@@ -443,24 +485,51 @@ class MainWindow(QMainWindow):
         self._advanced_dlg.exec()
 
     def _check_dependencies_first_run(self) -> None:
-        missing = missing_dependencies({
-            "FFmpeg": self._ffmpeg_path.text(),
-            "COLMAP": self._colmap_path.text(),
-            "GLOMAP": self._glomap_path.text(),
-        })
-        if not missing:
+        """Prompt to download missing essentials. Shown on every launch while
+        something is missing, until the user ticks "Don't ask again"."""
+        prefs = QSettings("OnTrack", "OnTrack")
+        if prefs.value("deps/dont_ask", False, type=bool):
             return
-        answer = QMessageBox.question(
-            self,
-            "Missing dependencies",
-            "Some dependencies aren't set up yet:\n\n• "
-            + "\n• ".join(missing)
-            + "\n\nOpen the Dependencies manager to review and install them?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
+        downloads = missing_downloads(self._configured_binaries())
+        if not downloads:
+            return
+
+        total_mb = sum(mb for _label, mb in downloads)
+        box = QMessageBox(self)
+        box.setWindowTitle("Set up dependencies")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            f"OnTrack needs to download the following (~{total_mb} MB total):\n\n• "
+            + "\n• ".join(f"{label}  (~{mb} MB)" for label, mb in downloads)
+            + "\n\nIf you already have FFmpeg/COLMAP/GLOMAP elsewhere, choose Later and"
+            " point to them in Settings → Dependencies."
         )
-        if answer == QMessageBox.StandardButton.Yes:
-            self._show_advanced(1)
+        download_btn = box.addButton("Download now", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        dont_ask = QCheckBox("Don't ask again")
+        box.setCheckBox(dont_ask)
+        box.exec()
+        prefs.setValue("deps/dont_ask", dont_ask.isChecked())
+        if box.clickedButton() is download_btn:
+            self._settings_tabs.setCurrentIndex(1)
+            self._deps_widget.refresh()
+            QTimer.singleShot(0, self._deps_widget.install_essentials)
+            self._advanced_dlg.exec()
+
+    def _configured_binaries(self) -> dict[str, str]:
+        return {
+            "ffmpeg": self._ffmpeg_path.text(),
+            "colmap": self._colmap_path.text(),
+            "glomap": self._glomap_path.text(),
+        }
+
+    def _on_binaries_installed(self, keys: list) -> None:
+        bins = default_binary_paths()
+        edits = {"ffmpeg": self._ffmpeg_path, "colmap": self._colmap_path, "glomap": self._glomap_path}
+        for key in keys:
+            edits[key].setText(str(bins[key]))
+            self._log.append(f"Installed {key}: {bins[key]}")
+        self._deps_widget.refresh()
 
     def _file_row(
         self,
@@ -507,9 +576,15 @@ class MainWindow(QMainWindow):
         if self._roto_objects():
             combo.addItem("Roto: All objects", ("roto", "all"))
         combo.addItem("+ Create new mask…", ("new",))
-        idx = combo.findData(current)
+        idx = self._find_combo_data(combo, current)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
+
+    @staticmethod
+    def _find_combo_data(combo: QComboBox, value) -> int:
+        """QComboBox.findData compares Python objects by identity, so look
+        tuple item data up by equality instead."""
+        return next((i for i in range(combo.count()) if combo.itemData(i) == value), -1)
 
     def _roto_objects(self):
         return self._roto.objects() if hasattr(self, "_roto") else []
@@ -529,9 +604,13 @@ class MainWindow(QMainWindow):
             if video is None:
                 QMessageBox.information(self, "No video", "Load a video first, then create a mask.")
             else:
+                self._pending_mask_role = role
                 self._tabs.setCurrentWidget(self._roto)
                 self._roto.open_editor(video)
-                self._log.append("Video sent to the Roto tab — masks will appear in these dropdowns.")
+                self._log.append(
+                    "Video sent to the Roto tab — the mask you create there is loaded"
+                    " automatically when you come back to the Track tab."
+                )
             combo.blockSignals(True)
             combo.setCurrentIndex(0)
             combo.blockSignals(False)
@@ -543,6 +622,24 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(0)
                 combo.blockSignals(False)
 
+    def _on_tab_changed(self, _index: int) -> None:
+        """Returning to Track after 'Create new mask': pick up the new mask."""
+        role = self._pending_mask_role
+        if role is None or self._tabs.currentWidget() is not self._track_tab:
+            return
+        self._roto.refresh_objects()
+        objects = self._roto_objects()
+        if not objects:
+            self._log.append("No roto masks yet — create one in the Roto tab, or pick a file.")
+            return
+        self._pending_mask_role = None
+        combo = self._matte_src if role == "ignore" else self._objmask_src
+        self._populate_mask_combo(combo)
+        target = ("roto", objects[0].object_id) if len(objects) == 1 else ("roto", "all")
+        idx = self._find_combo_data(combo, target)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)   # triggers _on_mask_source → matte build
+
     def _on_matte_ready(self, path: str, role: str) -> None:
         if role not in ("ignore", "object"):
             self._log.append(f"Roto matte exported: {path}")
@@ -550,6 +647,8 @@ class MainWindow(QMainWindow):
         target = self._matte_path if role == "ignore" else self._object_mask_path
         combo = self._matte_src if role == "ignore" else self._objmask_src
         target.setText(path)
+        if is_temp_path(path):
+            self._temp_mattes.add(Path(path))
         self._log.append(f"Roto matte ready for {'ignore matte' if role == 'ignore' else 'object mask'}: {path}")
         combo.blockSignals(True)
         combo.setCurrentIndex(0)
@@ -560,7 +659,6 @@ class MainWindow(QMainWindow):
         self._ffmpeg_path.setText(str(bins["ffmpeg"]))
         self._colmap_path.setText(str(bins["colmap"]))
         self._glomap_path.setText(str(bins["glomap"]))
-        self._out_path.setText(str(default_temp_root()))
         QTimer.singleShot(800, self._check_dependencies_first_run)
 
     # ---- Pickers ----
@@ -620,6 +718,7 @@ class MainWindow(QMainWindow):
             return
 
         self._video_file = path
+        self._dirty = True
         self._log.append(f"Loaded video: {path}")
 
         ffprobe = Path(self._ffmpeg_path.text()).parent / "ffprobe.exe"
@@ -747,7 +846,7 @@ class MainWindow(QMainWindow):
 
         config = PipelineConfig(
             input_video=self._video_file,
-            output_dir=Path(self._out_path.text()),
+            output_dir=Path(self._out_path.text().strip() or session_temp_root()),
             mask_video=mask_video,
             object_mask_video=object_mask_video,
             object_primitive="box",
@@ -847,6 +946,7 @@ class MainWindow(QMainWindow):
                 self._log.append(f"Could not load AR preview: {exc}")
 
         self._workspace_dir = self._runner.workspace.base if self._runner and self._runner.workspace else self._workspace_dir
+        self._adopt_temp_workspace(self._workspace_dir)
         self._save_project_btn.setEnabled(True)
         self._save_as_btn.setEnabled(True)
         self._dirty = True
@@ -1093,6 +1193,7 @@ class MainWindow(QMainWindow):
             "track_type": self._track_type_combo.currentData(),
             "mask_path": self._matte_path.text(),
             "object_mask_path": self._object_mask_path.text(),
+            "mask_grow": self._matte_shrink_spin.value(),
             "smoothing_window": self._smoothing_window,
             "use_gpu": self._gpu_check.isChecked(),
             "binary_paths": {
@@ -1102,29 +1203,67 @@ class MainWindow(QMainWindow):
             },
         }
 
+    # ---- Temp workspace housekeeping ----
+
+    def _adopt_temp_workspace(self, workspace: Path | None) -> None:
+        """Record a scratch workspace and drop older unsaved ones it replaces."""
+        if workspace is None or not is_temp_path(workspace):
+            return
+        workspace = Path(workspace)
+        for old in self._temp_workspaces:
+            if old != workspace:
+                clear_workspace(old)
+        self._temp_workspaces = [workspace]
+
+    def _cleanup_temp(self) -> None:
+        for path in [*self._temp_workspaces, *self._temp_mattes]:
+            try:
+                if path.is_dir():
+                    clear_workspace(path)
+                elif path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+        self._temp_workspaces.clear()
+        self._temp_mattes.clear()
+
+    def _persist_temp_mattes(self, project_dir: Path) -> None:
+        """Copy matte videos living in the temp folder into the project so the
+        saved settings don't point at files that vanish on exit."""
+        for edit in (self._matte_path, self._object_mask_path):
+            src = Path(edit.text().strip()) if edit.text().strip() else None
+            if src is None or not src.exists() or not is_temp_path(src):
+                continue
+            dest = project_dir / "mattes" / src.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            edit.setText(str(dest))
+
     def _save_project(self, save_as: bool = False) -> bool:
-        if not self._video_file:
-            QMessageBox.warning(self, "Nothing to save", "Load a video or run tracking first.")
+        if self._runner is not None and self._runner.is_running():
+            QMessageBox.warning(self, "Tracking in progress", "Wait for tracking to finish before saving the session.")
             return False
-
         source_workspace = self._workspace_dir
-        if not source_workspace or not Path(source_workspace).exists():
-            QMessageBox.warning(
-                self, "Nothing to save", "The tracking workspace no longer exists. Run tracking or load a project first."
-            )
-            return False
-        source_workspace = Path(source_workspace)
+        if source_workspace is not None and not Path(source_workspace).exists():
+            source_workspace = None
 
-        if save_as or self._project_dir is None:
-            default_dir = str(self._project_dir) if self._project_dir else ""
-            chosen = QFileDialog.getExistingDirectory(self, "Save Project Folder", default_dir)
+        if save_as or self._project_file is None:
+            suggested = str(self._project_file) if self._project_file else f"{self._video_file.stem if self._video_file else 'Untitled'}.json"
+            chosen, _ = QFileDialog.getSaveFileName(
+                self, "Save Project As", suggested, "OnTrack Project (*.json)"
+            )
             if not chosen:
                 return False
-            project_dir_path = Path(chosen)
+            project_file = Path(chosen)
+            if project_file.suffix.lower() != ".json":
+                project_file = project_file.with_suffix(".json")
         else:
-            project_dir_path = Path(self._project_dir)
+            project_file = self._project_file
+        project_dir_path = project_file.parent
 
         try:
+            roto_archive = self._roto.save_session(project_file)
+            self._persist_temp_mattes(project_dir_path)
             save_project(
                 project_dir_path,
                 self._video_file,
@@ -1134,6 +1273,13 @@ class MainWindow(QMainWindow):
                 orientation=self._orientation,
                 scale=self._scale,
                 z_rotation=self._z_rotation,
+                project_filename=project_file.name,
+                session={
+                    "roto_archive": roto_archive,
+                    "undistort": self._undistort.session_state(),
+                    "active_tab": self._tabs.currentIndex(),
+                    "object_track": self._object_track,
+                },
             )
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
@@ -1141,14 +1287,16 @@ class MainWindow(QMainWindow):
             return False
 
         self._project_dir = project_dir_path
-        self._workspace_dir = project_dir_path / "workspace"
+        self._project_file = project_file
+        workspace_name = "workspace" if project_file.name == "project.json" else f"{project_file.stem}.workspace"
+        self._workspace_dir = project_dir_path / workspace_name if source_workspace is not None else None
         self._dirty = False
         self._log.append(f"Project saved to: {project_dir_path}")
         return True
 
     def _load_project(self) -> None:
         project_file_str, _ = QFileDialog.getOpenFileName(
-            self, "Open Project", "", "GLOMAP Project (project.json)"
+            self, "Open Project", "", "OnTrack Project (*.json)"
         )
         if not project_file_str:
             return
@@ -1160,10 +1308,20 @@ class MainWindow(QMainWindow):
             self._log.append(f"Load project failed: {exc}")
             return
 
-        if "raw_track" not in data:
-            msg = f"No tracking data found in {data['sparse_dir']}. The project's workspace folder is missing or incomplete."
-            QMessageBox.critical(self, "Load failed", msg)
-            self._log.append(f"Load project failed: {msg}")
+        if self._runner is not None and self._runner.is_running():
+            QMessageBox.warning(self, "Tracking in progress", "Wait for tracking to finish before opening a session.")
+            return
+        session = data.get("session", {})
+        try:
+            archive_name = session.get("roto_archive")
+            archive_path = Path(project_file_str).parent / archive_name if archive_name else None
+            if archive_path is not None and archive_path.resolve().parent != Path(project_file_str).resolve().parent:
+                raise ValueError("Roto archive must be alongside the project file.")
+            self._pending_mask_role = None
+            self._roto.restore_session(archive_path)
+            self._undistort.restore_session(session.get("undistort", {}))
+        except Exception as exc:
+            QMessageBox.critical(self, "Load failed", str(exc))
             return
 
         # Restore settings.
@@ -1176,6 +1334,7 @@ class MainWindow(QMainWindow):
         self._on_track_type_changed()
         self._object_mask_path.setText(settings.get("object_mask_path", ""))
         self._matte_path.setText(settings.get("mask_path", ""))
+        self._matte_shrink_spin.setValue(settings.get("mask_grow", 0))
         self._ar_preview._smooth_window.setValue(settings.get("smoothing_window", 0))
         self._smoothing_window = settings.get("smoothing_window", 0)
         self._gpu_check.setChecked(settings.get("use_gpu", False))
@@ -1186,15 +1345,24 @@ class MainWindow(QMainWindow):
 
         # Restore video and metadata.
         self._video_file = data["input_video"]
-        self._load_video(self._video_file)
+        if self._video_file is not None:
+            self._load_video(self._video_file)
+        else:
+            self._video_info = {}
+            self._video_preview.clear_session()
+            self._update_metadata()
+        self._fps_spin.setValue(settings.get("fps", 24))
 
         # Restore tracking data.
         self._project_dir = data.get("project_dir")
+        self._project_file = Path(project_file_str)
         self._workspace_dir = data.get("workspace_dir")
         self._sparse_dir = data["sparse_dir"]
         self._frames_dir = data["frames_dir"]
         self._raw_track = data["raw_track"]
         self._raw_track_colmap = data["raw_track_colmap"]
+        self._object_track = session.get("object_track")
+        self._ar_preview.clear_session()
         self._oriented_track = data.get("oriented_track")
         self._orientation = data.get("orientation")
         self._point_cloud = data["point_cloud"]
@@ -1222,18 +1390,16 @@ class MainWindow(QMainWindow):
         self._save_as_btn.setEnabled(True)
         self._dirty = False
         self._update_export_buttons()
+        self._tabs.setCurrentIndex(max(0, min(int(session.get("active_tab", 0)), self._tabs.count() - 1)))
         self._log.append(f"Project loaded from: {project_file_str}")
 
     def closeEvent(self, event) -> None:
-        try:
-            self._roto.shutdown()
-        except Exception:
-            pass
-        if self._dirty and self._raw_track:
+        if self._dirty:
             answer = QMessageBox.question(
                 self,
                 "Unsaved project",
-                "The project has unsaved changes. Save before closing?",
+                "The session has unsaved changes. Unsaved temporary data may be lost"
+                " when OnTrack closes.\n\nSave before closing?",
                 QMessageBox.StandardButton.Save
                 | QMessageBox.StandardButton.Discard
                 | QMessageBox.StandardButton.Cancel,
@@ -1248,17 +1414,18 @@ class MainWindow(QMainWindow):
         if self._runner is not None and self._runner.is_running():
             self._runner.cancel()
             self._runner.wait(10000)
-        if self._cleanup_check.isChecked() and self._runner and self._runner.workspace:
-            try:
-                clear_workspace(self._runner.workspace.base)
-            except Exception:
-                pass
+        try:
+            self._roto.shutdown()
+        except Exception:
+            pass
+        self._cleanup_temp()
         event.accept()
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     apply_stylesheet(app)
+    install_file_dialog_memory()
     window = MainWindow()
     window.show()
     return app.exec()

@@ -11,9 +11,10 @@ from sammie.settings_manager import get_settings_manager
 utils_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(utils_dir, ".."))
 
-frames_dir = os.path.join(project_root, "temp", "frames")
-mask_dir = os.path.join(project_root, "temp", "masks")
-backup_dir = os.path.join(project_root, "temp", "masks_backup")
+_temp_root = os.path.join(project_root, os.environ.get("ONTRACK_ROTO_TEMP", "temp"))
+frames_dir = os.path.join(_temp_root, "frames")
+mask_dir = os.path.join(_temp_root, "masks")
+backup_dir = os.path.join(_temp_root, "masks_backup")
 
 # Use ORB comparison from opencv to compare two input frames/images for similarity
 def orb_comparison(img1, img2):

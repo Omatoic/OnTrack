@@ -1,12 +1,13 @@
 """Bridge between OnTrack and the vendored Sammie-Roto editor.
 
 The editor is embedded in-process in the Roto tab with ``roto/`` as the
-working directory, so all session state lands under ``roto/temp/``:
+working directory; its session scratch folder (``roto_temp()``, by default
+``%TEMP%/OnTrack/roto``) holds:
 
-    roto/temp/session_settings.conf   - JSON: video path, fps, total_frames
-    roto/temp/frames/{f:05d}.png      - decoded frames (0-based)
-    roto/temp/masks/{f:05d}/{id}.png  - per-object binary masks (white = object)
-    roto/temp/matting/{f:05d}/{id}.png - refined mattes (if matting was run)
+    session_settings.conf   - JSON: video path, fps, total_frames
+    frames/{f:05d}.png      - decoded frames (0-based)
+    masks/{f:05d}/{id}.png  - per-object binary masks (white = object)
+    matting/{f:05d}/{id}.png - refined mattes (if matting was run)
 
 OnTrack consumes the masks by merging them into a full-length white-on-black
 matte video (FFV1/MKV) which the tracking pipeline already understands.
@@ -23,7 +24,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.paths import project_root
+from core.paths import project_root, roto_temp_root
+
+# The vendored editor reads this to place its scratch folder (see
+# roto/sammie/core.py) in the OS temp dir instead of roto/temp.
+os.environ.setdefault("ONTRACK_ROTO_TEMP", str(roto_temp_root()))
 
 
 def roto_root() -> Path:
@@ -31,7 +36,7 @@ def roto_root() -> Path:
 
 
 def roto_temp() -> Path:
-    return roto_root() / "temp"
+    return Path(os.environ["ONTRACK_ROTO_TEMP"])
 
 
 def masks_dir() -> Path:
@@ -170,8 +175,10 @@ def encode_matte_video(
         "-loglevel", "error",
         "-framerate", f"{fps:g}",
         "-i", str(merged_dir / "%05d.png"),
-        "-c:v", "ffv1",
-        "-pix_fmt", "gray",
+        "-c:v", "prores_ks",
+        "-profile:v", "3",
+        "-pix_fmt", "yuv422p10le",
+        "-movflags", "+faststart",
         str(output),
     ]
     log(f"Encoding matte video: {' '.join(cmd)}")

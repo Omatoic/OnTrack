@@ -315,6 +315,31 @@ class ARPreviewWidget(QWidget):
         self._update_error_stats()
         self._update_info()
 
+    def clear_session(self) -> None:
+        self._pause()
+        self._renderer = None
+        self._current_index = 0
+        self._drag_start = None
+        self._drag_current = None
+        self._is_dragging = False
+        self._clear_selections()
+        self._frame_slider.blockSignals(True)
+        self._frame_slider.setRange(0, 0)
+        self._frame_slider.setValue(0)
+        self._frame_slider.blockSignals(False)
+        self._frame_slider.setEnabled(False)
+        self._play_btn.setEnabled(False)
+        self._reset_btn.setEnabled(False)
+        self._prune_threshold_btn.setEnabled(False)
+        self._delete_selected_btn.setEnabled(False)
+        self._z_rotation.blockSignals(True)
+        self._z_rotation.setValue(0.0)
+        self._z_rotation.blockSignals(False)
+        self._frame_label.clear()
+        self._frame_label.setText("No tracked video loaded")
+        self._update_error_stats()
+        self._update_info()
+
     def _on_frame_press(self, event: QMouseEvent) -> None:
         if self._renderer is None:
             return

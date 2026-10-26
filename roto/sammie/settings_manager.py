@@ -149,7 +149,8 @@ class SessionSettings:
 class SettingsManager:
     """Centralized settings management for the application"""
     
-    def __init__(self, temp_dir: str = "temp"):
+    def __init__(self, temp_dir: str | None = None):
+        temp_dir = temp_dir or os.environ.get("ONTRACK_ROTO_TEMP", "temp")
         self.temp_dir = temp_dir
 
         # Rename .json settings files to .conf for backward compatibility.
@@ -454,7 +455,7 @@ def get_settings_manager() -> SettingsManager:
         _settings_manager = SettingsManager()
     return _settings_manager
 
-def initialize_settings(temp_dir: str = "temp") -> SettingsManager:
+def initialize_settings(temp_dir: str | None = None) -> SettingsManager:
     """Initialize the global settings manager"""
     global _settings_manager
     _settings_manager = SettingsManager(temp_dir)

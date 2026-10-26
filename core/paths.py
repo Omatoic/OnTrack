@@ -1,5 +1,7 @@
 import os
 import shutil
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,36 +16,86 @@ def default_dependency_root() -> Path:
     return project_root() / "Dependencies"
 
 
-def _find_binary(directory: Path, name: str) -> Path:
-    """Look for an executable in a directory or its bin subdirectory."""
-    for sub in (directory, directory / "bin"):
-        candidate = sub / name
-        if candidate.exists():
-            return candidate
-    # Fall back to the direct location even if it does not exist yet.
-    return directory / name
+def _find_binary(directories: list[Path], name: str) -> Path:
+    """Look for an executable in each directory or its bin subdirectory."""
+    for directory in directories:
+        for sub in (directory, directory / "bin"):
+            candidate = sub / name
+            if candidate.exists():
+                return candidate
+    # Fall back to where the downloader installs it, even if it doesn't exist yet.
+    return directories[-1] / "bin" / name
+
+
+# Where the in-app downloader installs each binary (relative to Dependencies/).
+BINARY_INSTALL_DIRS = {
+    "ffmpeg": "03 FFMPEG",
+    "colmap": "01 GLOMAP/colmap",
+    "glomap": "01 GLOMAP/glomap",
+}
 
 
 def default_binary_paths() -> dict[str, Path]:
-    """Return default absolute paths to the bundled binaries."""
+    """Return default absolute paths to the bundled binaries. A flat
+    '01 GLOMAP' folder (hand-assembled) is honoured before the downloader's
+    per-tool subfolders."""
     dep = default_dependency_root()
+    ffmpeg_dirs = [dep / BINARY_INSTALL_DIRS["ffmpeg"]]
     return {
-        "ffmpeg": _find_binary(dep / "03 FFMPEG", "ffmpeg.exe"),
-        "ffprobe": _find_binary(dep / "03 FFMPEG", "ffprobe.exe"),
-        "colmap": _find_binary(dep / "01 GLOMAP", "colmap.exe"),
-        "glomap": _find_binary(dep / "01 GLOMAP", "glomap.exe"),
+        "ffmpeg": _find_binary(ffmpeg_dirs, "ffmpeg.exe"),
+        "ffprobe": _find_binary(ffmpeg_dirs, "ffprobe.exe"),
+        "colmap": _find_binary([dep / "01 GLOMAP", dep / BINARY_INSTALL_DIRS["colmap"]], "colmap.exe"),
+        "glomap": _find_binary([dep / "01 GLOMAP", dep / BINARY_INSTALL_DIRS["glomap"]], "glomap.exe"),
     }
 
 
 def default_temp_root() -> Path:
-    """Return the default temporary workspace root."""
-    return project_root() / "temp_workspace"
+    """Scratch root in the OS temp folder. Everything under it is disposable:
+    it is wiped on exit and stale leftovers are purged on startup. Saving a
+    project copies what's needed out of here."""
+    return Path(tempfile.gettempdir()) / "OnTrack"
+
+
+def session_temp_root() -> Path:
+    return default_temp_root() / "sessions"
+
+
+def matte_temp_root() -> Path:
+    return default_temp_root() / "mattes"
+
+
+def roto_temp_root() -> Path:
+    return default_temp_root() / "roto"
+
+
+def is_temp_path(path: Path | str | None) -> bool:
+    if not path:
+        return False
+    try:
+        return Path(path).resolve().is_relative_to(default_temp_root().resolve())
+    except OSError:
+        return False
+
+
+def purge_stale_temp(max_age_hours: float = 24.0) -> None:
+    """Delete session/matte leftovers older than max_age_hours (e.g. from a
+    crash). The age guard keeps a concurrently running instance safe."""
+    cutoff = time.time() - max_age_hours * 3600
+    for root in (session_temp_root(), matte_temp_root()):
+        if not root.exists():
+            continue
+        for entry in root.iterdir():
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+            except OSError:
+                pass
 
 
 def make_session_workspace(root: Path | None = None) -> Path:
     """Create a fresh per-session workspace and return its path."""
     if root is None:
-        root = default_temp_root()
+        root = session_temp_root()
     session_dir = root / datetime.now().strftime("session_%Y%m%d_%H%M%S")
     (session_dir / "01_frames").mkdir(parents=True, exist_ok=True)
     (session_dir / "02_database").mkdir(parents=True, exist_ok=True)

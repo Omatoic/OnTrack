@@ -74,6 +74,25 @@ class VideoPreviewWidget(QWidget):
         self._update_frame_info()
         self._show_frame(0)
 
+    def clear_session(self) -> None:
+        self._pause()
+        if self._source is not None:
+            try:
+                self._source.close()
+            except Exception:
+                pass
+        self._source = None
+        self._current_frame = 0
+        self._frame_slider.blockSignals(True)
+        self._frame_slider.setRange(0, 0)
+        self._frame_slider.setValue(0)
+        self._frame_slider.blockSignals(False)
+        self._frame_slider.setEnabled(False)
+        self._play_btn.setEnabled(False)
+        self._frame_label.clear()
+        self._frame_label.setText("No video loaded")
+        self._update_frame_info()
+
     def _slider_changed(self, value: int) -> None:
         self._current_frame = value
         self._show_frame(value)

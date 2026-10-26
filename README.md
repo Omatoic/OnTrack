@@ -28,8 +28,9 @@ OnTrack/
 │   │   └── *.dll
 │   └── 03 FFMPEG/bin/
 │       └── ffmpeg.exe
-└── temp_workspace/              # Created automatically per session
 ```
+
+Scratch data (tracking workspaces, roto mattes, the roto editor's session) lives in `%TEMP%\OnTrack\`, not in the project folder — see [Temporary Files](#temporary-files).
 
 ## Setup
 
@@ -67,19 +68,33 @@ If you see `[ontrack] roto deps missing; relaunching with …`, that's the boots
 
 The **Settings → Dependencies…** dialog lists every dependency with found/missing status and install buttons:
 
-- **Binaries** — FFmpeg / COLMAP / GLOMAP paths (auto-detected from `Dependencies/`).
+- **Programs** — FFmpeg / COLMAP / GLOMAP, auto-detected from `Dependencies/` (or browse to your own copies). Missing ones download and unpack automatically: FFmpeg (gyan.dev essentials) → `Dependencies/03 FFMPEG/`, COLMAP 3.12.6 → `Dependencies/01 GLOMAP/colmap/`, GLOMAP 1.2.0 → `Dependencies/01 GLOMAP/glomap/`. Versions are pinned (CPU builds) because COLMAP 4.x renamed CLI options the pipeline uses.
 - **Tracking models** — SuperPoint/LightGlue ONNX downloads for Learned/Object Track, and `superpoint_lowthr.onnx` generation.
 - **Roto models** — SAM2 checkpoints + MatAnyone weights, downloaded into `roto/checkpoints` via the roto model manager (resume + checksum).
 
-On first launch the app prompts if anything is missing.
+On launch, if anything is missing, the app lists it with sizes and offers to **Download now** (everything on a fresh install: FFmpeg, COLMAP, GLOMAP, SuperPoint/LightGlue, SAM2 Base+, MatAnyone — ~720 MB). Tick *Don't ask again* to silence it; **Download all essentials** in the Dependencies page does the same thing at any time.
+
+## Temporary Files
+
+Unless you save a project, OnTrack writes only to `%TEMP%\OnTrack\`:
+
+- `sessions\` — tracking workspaces (frames, COLMAP database, sparse model). Each new successful run deletes the previous unsaved one, and all of them are deleted on exit.
+- `mattes\` — matte videos generated from roto masks for the Track tab. Deleted on exit.
+- `roto\` — the roto editor's working session (frames + masks). Kept between launches so the editor can resume; replaced whenever you load a new video.
+
+Leftover `sessions\`/`mattes\` older than 24 h (e.g. after a crash) are purged on startup.
+
+**Save Project** copies the workspace into the project folder and copies any temp matte videos into `<project>\mattes\`, so saved projects never depend on temp files. Setting an explicit **Output folder** in the Track tab keeps every run's workspace there permanently instead.
 
 ## Usage
 
 1. Add a video by clicking **Add Video** or dragging and dropping a video file onto the window.
 2. Review the video preview and metadata (resolution, duration, FPS, frame count). The FPS field auto-populates from the video.
-3. Set FPS, frame skip, and track type. Binary paths and tuning knobs live in **Settings → Tracking Settings…**.
+3. Set FPS, frame skip, track type and (if using an ignore matte) **Matte grow/shrink**. Binary paths and remaining tuning knobs live in **Settings → Tracking Settings…**.
 4. Click **Run Tracking**.
 5. When complete, export to **After Effects (.jsx)** or **Blender (.py)** from the Export tab.
+
+File browsers (including the Roto editor's) reopen in the last folder you used for that kind of file — videos, images, executables, etc. are remembered separately.
 
 ## Track Type
 
@@ -101,20 +116,21 @@ The **Roto** tab embeds a vendored copy of Sammie-Roto (SAM2-based roto, in `rot
 
 Because the editor runs in-process, OnTrack must run on a Python environment that has Sammie's dependencies (torch, av, PySide6). `run.bat` prefers `roto\.venv` — a dedicated Python 3.12 environment containing the full Sammie + OnTrack dependency set — and falls back to the Sammie-Roto install's venv, then the plain `.venv` (where everything works except the embedded roto editor). `main.py` auto-relaunches under the roto venv when needed, so any launch method works.
 
-Model checkpoints are shared via the `roto/checkpoints` junction; the editor's session lives in `roto/temp/` (masks: `roto/temp/masks/<frame>/<object>.png`).
+Model checkpoints are shared via the `roto/checkpoints` junction; the editor's session lives in `%TEMP%\OnTrack\roto\` (masks: `masks\<frame>\<object>.png`).
 
 Workflow:
 1. Load a video in the Track tab.
 2. In the Track tab's mask dropdowns (next to *Ignore matte* / *Object mask*), choose **+ Create new mask…** — the Roto tab opens with the video loaded in the editor.
-3. Segment objects (and optionally run **Refine Matte** for soft edges); masks appear live in the Roto tab's mask list (right panel) and in the Track tab dropdowns (`Roto: <object>` / `Roto: All objects`). Refined mattes are preferred automatically when present.
-4. Selecting a roto mask merges the per-object PNGs into a lossless matte video (`roto/exports/`) and fills in the path automatically — the tracking pipeline consumes it as usual.
+3. Segment objects (and optionally run **Refine Matte** for soft edges). When you switch back to the Track tab, the new mask is loaded into the field you started from automatically (a single object, or *All objects* if you made several). Masks are also listed in the Roto tab's right panel and in the Track tab dropdowns (`Roto: <object>` / `Roto: All objects`) for picking manually. Refined mattes are preferred automatically when present.
+4. Selecting a roto mask merges the per-object PNGs into a ProRes HQ MOV matte video (`%TEMP%\OnTrack\mattes\`) and fills in the path automatically — the tracking pipeline consumes it as usual.
 
-**Export Matte Video…** in the Roto panel writes a standalone matte (soft alpha edges preserved) for the selected objects — handy for compositing.
+**Export Matte Video…** in the Roto panel writes a standalone QuickTime `.mov` using ProRes 422 HQ for the selected objects. Refined soft edges are retained in the black-and-white matte; use it as a luma/track matte in your NLE (it is not an embedded alpha channel).
+
+**File → Save** (`Ctrl+S`) and **File → Save As…** (`Ctrl+Shift+S`) are available from every tab, even before tracking or loading a video. Save As lets you choose a project filename such as `My Shot.json`. Sessions include tracking settings, the active tab, Undistort inputs/options and the calibrated lens profile. If present, tracking data is kept in `My Shot.workspace`, and Roto frames, masks, refined mattes, points and editor settings are stored in `My Shot.roto.zip`. Opening the JSON restores the session without requiring tracking results. Keep these companion files/folders and any saved `mattes` folder together when moving a project; original source media remains externally referenced. Wait for active tracking/Roto processing to finish before saving or opening another session. Existing `project.json` projects remain supported.
 
 ## Notes / Known Limitations
 
 - **Coordinate conversion**: The AE orientation is currently derived using XYZ Euler angles. Depending on your footage you may need to adjust the rotation order or add a null target. This is the area most likely to need tweaking.
-- **Cleanup**: Enable *Clean workspace on exit* to delete the temporary frames/database/sparse folder when the app closes.
 - **Progress**: GLOMAP progress is parsed from `Processing image [X/Y]` style output; if your build prints differently, the bar will use stage-based increments instead.
 
 ## License

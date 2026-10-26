@@ -2,6 +2,7 @@
 tracking or redistort rendered footage for delivery."""
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -481,3 +482,48 @@ class UndistortWidget(QWidget):
         self._cancel_btn.setEnabled(False)
         self._progress.setValue(100 if ok else 0)
         self._log.append(msg if ok else f"Failed: {msg}")
+
+    def session_state(self) -> dict:
+        return {
+            "calibration_image": self._cal_img.text(),
+            "pattern": self._pattern_combo.currentText(),
+            "profile_path": self._profile_path.text(),
+            "profile": asdict(self._profile) if self._profile is not None else None,
+            "input_video": self._in_video.text(),
+            "output_video": self._out_video.text(),
+            "mode": self._mode(),
+        }
+
+    def restore_session(self, state: dict) -> None:
+        self._cal_img.setText(state.get("calibration_image", ""))
+        idx = self._pattern_combo.findText(state.get("pattern", ""))
+        if idx >= 0:
+            self._pattern_combo.setCurrentIndex(idx)
+        self._profile_path.setText(state.get("profile_path", ""))
+        self._in_video.setText(state.get("input_video", ""))
+        self._out_video.setText(state.get("output_video", ""))
+        redistort = state.get("mode") == "redistort"
+        self._mode_redistort.setChecked(redistort)
+        self._mode_undistort.setChecked(not redistort)
+        profile = None
+        data = state.get("profile")
+        if isinstance(data, dict):
+            try:
+                profile = LensProfile(**data)
+            except (TypeError, ValueError):
+                profile = None
+        if profile is None:
+            path = self._profile_path.text().strip()
+            if path and Path(path).exists():
+                try:
+                    profile = LensProfile.load(Path(path))
+                except (OSError, TypeError, ValueError):
+                    profile = None
+        self._profile = profile
+        if profile is not None:
+            self._profile_info.setText(
+                f"Center: ({profile.xcenter:.1f}, {profile.ycenter:.1f})  "
+                f"Image: {profile.width}x{profile.height}  "
+                f"Coefs: {len(profile.undistort_coefs)}")
+        else:
+            self._profile_info.setText("No profile loaded")

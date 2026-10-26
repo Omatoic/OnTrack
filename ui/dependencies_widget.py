@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
+import zipfile
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, Qt, QThread, Signal
@@ -22,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import roto
-from core.paths import default_dependency_root, project_root
+from core.paths import BINARY_INSTALL_DIRS, default_binary_paths, default_dependency_root, project_root
 
 LIGHTGLUE_RELEASE = "https://github.com/fabio-sim/LightGlue-ONNX/releases/download/v0.1.3"
 
@@ -32,6 +34,17 @@ ONNX_MODELS = [
     ("superpoint_lightglue.onnx", "SuperPoint + LightGlue matcher",
      f"{LIGHTGLUE_RELEASE}/superpoint_lightglue.onnx"),
     ("superpoint_lowthr.onnx", "SuperPoint low-threshold (recommended)", None),
+]
+
+# (key, label, zip url, approx MB). Pinned to COLMAP 3.12.x / GLOMAP 1.2.0:
+# COLMAP 4.x renamed CLI options the pipeline relies on. CPU ("nocuda")
+# builds run everywhere; SIFT runs on CPU by default anyway.
+BINARY_DOWNLOADS = [
+    ("ffmpeg", "FFmpeg", "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip", 115),
+    ("colmap", "COLMAP 3.12.6",
+     "https://github.com/colmap/colmap/releases/download/3.12.6/colmap-x64-windows-nocuda.zip", 88),
+    ("glomap", "GLOMAP 1.2.0",
+     "https://github.com/colmap/glomap/releases/download/1.2.0/glomap-x64-windows-nocuda.zip", 18),
 ]
 
 # (registry key, checkpoint filename, label)
@@ -49,10 +62,14 @@ class _DownloadWorker(QThread):
     progress = Signal(str)
     finished = Signal(bool, str)
 
-    def __init__(self, url: str, dest: Path, parent=None):
+    def __init__(self, url: str, dest: Path, parent=None, extract_to: Path | None = None):
+        """Download url to dest. With extract_to, dest is a temporary zip that
+        is unpacked into extract_to (a single top-level folder is flattened)
+        and then deleted."""
         super().__init__(parent)
         self._url = url
         self._dest = dest
+        self._extract_to = extract_to
 
     def run(self) -> None:
         try:
@@ -72,9 +89,32 @@ class _DownloadWorker(QThread):
                                 f"{self._dest.name}: {done/1e6:.0f}/{total/1e6:.0f} MB"
                             )
             part.replace(self._dest)
-            self.finished.emit(True, f"Downloaded {self._dest.name}")
+            if self._extract_to is not None:
+                self.progress.emit(f"Extracting {self._dest.name}…")
+                _extract_flat(self._dest, self._extract_to)
+                self._dest.unlink()
+            self.finished.emit(True, f"Installed {self._dest.name}")
         except Exception as exc:
             self.finished.emit(False, f"Download failed: {exc}")
+
+
+def _extract_flat(archive: Path, target: Path) -> None:
+    staging = target.with_name(target.name + ".extracting")
+    if staging.exists():
+        shutil.rmtree(staging)
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(staging)
+    entries = list(staging.iterdir())
+    root = entries[0] if len(entries) == 1 and entries[0].is_dir() and entries[0].name != "bin" else staging
+    target.mkdir(parents=True, exist_ok=True)
+    for item in root.iterdir():
+        dest = target / item.name
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        elif dest.exists():
+            dest.unlink()
+        shutil.move(str(item), str(dest))
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _status(ok: bool, detail: str = "") -> QLabel:
@@ -86,8 +126,13 @@ def _status(ok: bool, detail: str = "") -> QLabel:
 class DependenciesWidget(QWidget):
     """Lists every downloadable dependency with status + install actions."""
 
-    def __init__(self, parent=None):
+    binaries_installed = Signal(list)   # keys from BINARY_DOWNLOADS
+
+    def __init__(self, parent=None, binary_paths_getter=None):
         super().__init__(parent)
+        # Returns {"ffmpeg"|"colmap"|"glomap": configured path}; lets the
+        # status reflect paths the user browsed to, not just the defaults.
+        self._binary_paths_getter = binary_paths_getter or default_binary_paths
         self._workers: list[QThread] = []
         self._build_ui()
         self.refresh()
@@ -107,7 +152,32 @@ class DependenciesWidget(QWidget):
         self._env_label = QLabel()
         self._env_label.setWordWrap(True)
         env_layout.addWidget(self._env_label)
+        self._essentials_btn = QPushButton("Download all essentials")
+        self._essentials_btn.setToolTip(
+            "SuperPoint/LightGlue tracking models, SAM2 Base+ and MatAnyone (~500 MB total)"
+        )
+        self._essentials_btn.clicked.connect(self.install_essentials)
+        env_layout.addWidget(self._essentials_btn, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(env_group)
+
+        # --- Programs ---
+        bin_group = QGroupBox("Programs — FFmpeg, COLMAP, GLOMAP (required)")
+        bin_layout = QVBoxLayout(bin_group)
+        for key, label, url, mb in BINARY_DOWNLOADS:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{label} (~{mb} MB)"), 2)
+            status = QLabel()
+            status.setObjectName(f"status_bin_{key}")
+            row.addWidget(status, 1)
+            btn = QPushButton("Download")
+            btn.clicked.connect(lambda _c, k=key: self._download_binary(k))
+            row.addWidget(btn)
+            bin_layout.addLayout(row)
+        bin_note = QLabel(f"Installed into {default_dependency_root()}.")
+        bin_note.setWordWrap(True)
+        bin_note.setStyleSheet("color: #a0a0a0; font-size: 9pt;")
+        bin_layout.addWidget(bin_note)
+        layout.addWidget(bin_group)
 
         # --- Tracking models ---
         onnx_group = QGroupBox("Tracking models — needed for Learned / Object Track")
@@ -129,17 +199,6 @@ class DependenciesWidget(QWidget):
         note.setStyleSheet("color: #a0a0a0; font-size: 9pt;")
         self._roto_layout.addWidget(note)
         layout.addWidget(roto_group)
-
-        # --- ffmpeg binaries ---
-        ff_group = QGroupBox("FFmpeg (needed if not bundled)")
-        ff_layout = QHBoxLayout(ff_group)
-        self._ffmpeg_status = QLabel()
-        ff_layout.addWidget(self._ffmpeg_status)
-        ff_layout.addStretch()
-        dl = QPushButton("Download FFmpeg build…")
-        dl.clicked.connect(lambda: os.startfile("https://www.gyan.dev/ffmpeg/builds/"))
-        ff_layout.addWidget(dl)
-        layout.addWidget(ff_group)
 
         open_btn = QPushButton("Open Dependencies folder")
         open_btn.clicked.connect(
@@ -201,13 +260,13 @@ class DependenciesWidget(QWidget):
                 lbl.setText(("✔ found" if ok else "✖ missing"))
                 lbl.setStyleSheet(f"color: {'#28a745' if ok else '#dc3545'}; font-weight: bold;")
 
-        ffmpeg = deps / "03 FFMPEG" / "bin" / "ffmpeg.exe"
-        self._ffmpeg_status.setText(
-            "✔ bundled ffmpeg found" if ffmpeg.exists() else "✖ bundled ffmpeg missing"
-        )
-        self._ffmpeg_status.setStyleSheet(
-            f"color: {'#28a745' if ffmpeg.exists() else '#dc3545'}; font-weight: bold;"
-        )
+        configured = self._binary_paths_getter()
+        for key, _label, _url, _mb in BINARY_DOWNLOADS:
+            lbl = self.findChild(QLabel, f"status_bin_{key}")
+            if lbl:
+                ok = Path(configured.get(key, "")).is_file()
+                lbl.setText(("✔ found" if ok else "✖ missing"))
+                lbl.setStyleSheet(f"color: {'#28a745' if ok else '#dc3545'}; font-weight: bold;")
 
         have = all(importlib.util.find_spec(m) for m in ("av", "torch"))
         self._env_label.setText(
@@ -217,11 +276,56 @@ class DependenciesWidget(QWidget):
 
     # ---- Actions ----
 
-    def _download(self, url: str, fname: str) -> None:
-        dest = default_dependency_root() / "06 MODELS" / fname
-        worker = _DownloadWorker(url, dest, self)
+    def install_essentials(self) -> None:
+        """Download every missing essential. Programs and ONNX tracking models
+        download one after another in the background (then the low-threshold
+        SuperPoint model is derived); roto checkpoints use the roto model
+        manager's own progress dialog meanwhile."""
+        models = default_dependency_root() / "06 MODELS"
+        configured = self._binary_paths_getter()
+        jobs = [
+            lambda done, k=key: self._download_binary(k, on_done=done)
+            for key, _l, _u, _mb in BINARY_DOWNLOADS
+            if not Path(configured.get(key, "")).is_file()
+        ] + [
+            lambda done, u=url, f=fname: self._download(u, f, on_done=done)
+            for fname, _l, url in ONNX_MODELS
+            if url and not (models / fname).exists()
+        ]
+        gen_lowthr = not (models / "superpoint_lowthr.onnx").exists()
+
+        def next_job(ok: bool = True, _msg: str = "") -> None:
+            if jobs:
+                jobs.pop(0)(next_job)   # keep going even if one item failed
+            elif gen_lowthr and (models / "superpoint.onnx").exists():
+                self._generate_lowthr()
+
+        next_job()
+        if roto_keys := missing_roto_keys():
+            self._download_roto(roto_keys)
+
+    def _download_binary(self, key: str, on_done=None) -> None:
+        _k, label, url, _mb = next(b for b in BINARY_DOWNLOADS if b[0] == key)
+        target = default_dependency_root() / BINARY_INSTALL_DIRS[key]
+        archive = default_dependency_root() / "_downloads" / Path(url).name
+
+        def finished(ok: bool, _msg: str) -> None:
+            if ok:
+                self.binaries_installed.emit([key])
+
+        self._download(url, archive.name, on_done=on_done, dest=archive,
+                       extract_to=target, before_done=finished)
+
+    def _download(self, url: str, fname: str, on_done=None, dest: Path | None = None,
+                  extract_to: Path | None = None, before_done=None) -> None:
+        dest = dest or default_dependency_root() / "06 MODELS" / fname
+        worker = _DownloadWorker(url, dest, self, extract_to=extract_to)
+        if before_done is not None:
+            worker.finished.connect(before_done)
         worker.progress.connect(self._set_status_line)
         worker.finished.connect(self._on_download_done)
+        if on_done is not None:
+            worker.finished.connect(on_done)
         self._workers.append(worker)
         self._set_status_line(f"Downloading {fname}…")
         worker.start()
@@ -250,7 +354,7 @@ class DependenciesWidget(QWidget):
         else:
             proc.start(sys.executable, [str(script)])
 
-    def _download_roto(self, key: str) -> None:
+    def _download_roto(self, key: str | list[str]) -> None:
         try:
             os.chdir(roto.roto_root())
             root = str(roto.roto_root())
@@ -276,16 +380,29 @@ class DependenciesWidget(QWidget):
         self.refresh()
 
 
-def missing_dependencies(binaries: dict[str, Path]) -> list[str]:
-    """Human-readable list of anything that's absent. For the first-run prompt."""
-    missing = []
-    for name, path in binaries.items():
-        if not Path(path).exists():
-            missing.append(f"{name} binary")
-    models = default_dependency_root() / "06 MODELS"
-    if not (models / "superpoint.onnx").exists() or not (models / "superpoint_lightglue.onnx").exists():
-        missing.append("learned-tracking ONNX models (optional — needed for Learned/Object Track)")
+def missing_roto_keys() -> list[str]:
     ckpts = roto.roto_root() / "checkpoints"
+    keys = []
     if not any((ckpts / f).exists() for _k, f, _l in ROTO_MODELS[:4]):
-        missing.append("SAM2 checkpoint (needed by the Roto tab)")
+        keys.append("Base")
+    if not any((ckpts / f).exists() for _k, f, _l in ROTO_MODELS[4:]):
+        keys.append("matanyone")
+    return keys
+
+
+def missing_downloads(binaries: dict[str, str | Path]) -> list[tuple[str, int]]:
+    """(label, approx MB) for every essential that isn't installed yet.
+    ``binaries`` maps "ffmpeg"/"colmap"/"glomap" to the configured paths."""
+    models = default_dependency_root() / "06 MODELS"
+    missing = [
+        (label, mb) for key, label, _u, mb in BINARY_DOWNLOADS
+        if not Path(binaries.get(key, "")).is_file()
+    ]
+    missing += [
+        (label, 50 if "LightGlue" in label else 5)
+        for fname, label, url in ONNX_MODELS if url and not (models / fname).exists()
+    ]
+    sizes = {"Base": ("SAM2 Base+ segmentation model (Roto tab)", 320),
+             "matanyone": ("MatAnyone matte refinement model (Roto tab)", 140)}
+    missing += [sizes[k] for k in missing_roto_keys()]
     return missing

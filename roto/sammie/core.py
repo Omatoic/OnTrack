@@ -11,7 +11,7 @@ from sammie.settings_manager import get_settings_manager
 # Global variables
 # .........................................................................................
 
-temp_dir = "temp"
+temp_dir = os.environ.get("ONTRACK_ROTO_TEMP", "temp")
 frames_dir = os.path.join(temp_dir, "frames")
 mask_dir = os.path.join(temp_dir, "masks")
 backup_dir = os.path.join(temp_dir, "masks_backup")

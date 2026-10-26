@@ -30,25 +30,28 @@ def _to_native(obj: Any) -> Any:
 
 def save_project(
     project_dir: Path,
-    input_video: Path,
+    input_video: Path | None,
     workspace_dir: Path | None = None,
     settings: dict[str, Any] | None = None,
     oriented_track: list[dict[str, Any]] | None = None,
     orientation: dict[str, Any] | None = None,
     scale: float = 1.0,
     z_rotation: float = 0.0,
+    project_filename: str = "project.json",
+    session: dict[str, Any] | None = None,
 ) -> Path:
     """Save a project by copying the workspace and writing metadata."""
     project_dir = Path(project_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
+    workspace_name = "workspace" if project_filename == "project.json" else f"{Path(project_filename).stem}.workspace"
 
     if workspace_dir is not None:
         workspace_dir = Path(workspace_dir)
-        saved_workspace = project_dir / "workspace"
+        saved_workspace = project_dir / workspace_name
         if not workspace_dir.exists():
             raise FileNotFoundError(f"Workspace folder not found: {workspace_dir}")
         if workspace_dir.resolve() != saved_workspace.resolve():
-            staging = project_dir / "workspace.saving"
+            staging = project_dir / f"{workspace_name}.saving"
             if staging.exists():
                 shutil.rmtree(staging)
             shutil.copytree(workspace_dir, staging)
@@ -58,9 +61,10 @@ def save_project(
 
     data: dict[str, Any] = {
         "version": PROJECT_VERSION,
-        "input_video": str(input_video),
-        "settings": _to_native(settings),
-        "workspace": "workspace",
+        "input_video": str(input_video) if input_video else None,
+        "settings": _to_native(settings or {}),
+        "session": _to_native(session or {}),
+        "workspace": workspace_name if workspace_dir is not None else None,
         "z_rotation": z_rotation,
         "scale": scale,
     }
@@ -69,7 +73,7 @@ def save_project(
     if orientation is not None:
         data["orientation"] = _to_native(orientation)
 
-    project_file = project_dir / "project.json"
+    project_file = project_dir / project_filename
     with project_file.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
@@ -83,7 +87,8 @@ def load_project(project_file: Path) -> dict[str, Any]:
         data = json.load(f)
 
     project_dir = project_file.parent
-    workspace_dir = project_dir / data.get("workspace", "workspace")
+    workspace_name = data.get("workspace", "workspace")
+    workspace_dir = project_dir / (workspace_name or "workspace")
     sparse_dir = workspace_dir / "03_sparse" / "0"
     cameras_txt = sparse_dir / "cameras.txt"
     images_txt = sparse_dir / "images.txt"
@@ -92,14 +97,21 @@ def load_project(project_file: Path) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "project_dir": project_dir,
-        "workspace_dir": workspace_dir,
-        "input_video": Path(data["input_video"]),
-        "settings": data.get("settings", {}),
-        "frames_dir": frames_dir,
-        "sparse_dir": sparse_dir,
+        "workspace_dir": workspace_dir if workspace_name else None,
+        "input_video": Path(data["input_video"]) if data.get("input_video") else None,
+        "settings": data.get("settings") or {},
+        "session": data.get("session") or {},
+        "raw_track": None,
+        "raw_track_colmap": None,
+        "frames_dir": frames_dir if workspace_name else None,
+        "sparse_dir": sparse_dir if workspace_name else None,
         "scale": data.get("scale", 1.0),
         "z_rotation": data.get("z_rotation", 0.0),
     }
+
+    if not workspace_name:
+        result["point_cloud"] = []
+        return result
 
     if cameras_txt.exists() and images_txt.exists():
         raw_track_blender = build_camera_track(images_txt, cameras_txt, target="blender")

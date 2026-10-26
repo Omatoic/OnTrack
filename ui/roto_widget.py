@@ -12,10 +12,15 @@ from __future__ import annotations
 import os
 import sys
 import traceback
+import shutil
+import tempfile
+import zipfile
+from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -30,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import roto
+from core.paths import matte_temp_root
 
 # The vendored Sammie UI was designed for a light native theme; OnTrack's
 # global dark stylesheet doesn't cover enough widget types to keep it legible.
@@ -176,7 +182,7 @@ class MatteWorker(QThread):
             if nonempty == 0:
                 self.failed.emit("Selected roto objects produced no masks.", self._role)
                 return
-            out = self._output or roto.roto_root() / "exports" / f"matte_{stamp}.mkv"
+            out = self._output or matte_temp_root() / f"matte_{stamp}.mov"
             path = roto.encode_matte_video(merged, out, self._ffmpeg, self._fps, log=print)
             self.finished_ok.emit(str(path), self._role)
         except Exception as exc:
@@ -205,6 +211,7 @@ class RotoWidget(QWidget):
     """Hosts the Sammie-Roto editor and exposes its masks to OnTrack."""
 
     objects_changed = Signal()
+    session_changed = Signal()
     matte_ready = Signal(str, str)          # path, role ("ignore" | "object")
     status_message = Signal(str)
 
@@ -318,6 +325,7 @@ class RotoWidget(QWidget):
     def _on_module_imported(self, sammie_main) -> None:
         try:
             self._sammie = sammie_main.MainWindow()
+            self._sammie.point_manager.add_callback(lambda *args, **kwargs: self.session_changed.emit())
             self._sammie.setStyleSheet(SAMMIE_DARK_QSS)
             # Keep Segmentation + Matting (for refining mattes); hide Object
             # Removal, which stays available in the standalone tool.
@@ -373,6 +381,73 @@ class RotoWidget(QWidget):
         if video is not None:
             self._open_in_sammie(video)
         return True
+
+    def save_session(self, project_file: Path) -> str | None:
+        self._check_session_idle()
+        if self._sammie is not None:
+            w = self._sammie
+            w._save_current_ui_state()
+            w.settings_mgr.save_points(w.point_manager.get_all_points())
+            w.settings_mgr.save_session_settings()
+        if not roto.session_info():
+            return None
+        target = project_file.with_suffix(".roto.zip")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
+        try:
+            with zipfile.ZipFile(staging, "w", zipfile.ZIP_DEFLATED) as archive:
+                for path in roto.roto_temp().rglob("*"):
+                    relative = path.relative_to(roto.roto_temp())
+                    if path.is_file() and relative.parts[0] != "ontrack_matte":
+                        archive.write(path, relative.as_posix())
+            os.replace(staging, target)
+        finally:
+            staging.unlink(missing_ok=True)
+        return target.name
+
+    def _check_session_idle(self) -> None:
+        if self._loading or any(thread.isRunning() for thread in self.findChildren(QThread)):
+            raise RuntimeError("Wait for Roto processing to finish before saving or opening a session.")
+
+    def restore_session(self, archive_path: Path | None) -> None:
+        self._check_session_idle()
+        root = roto.roto_temp()
+        root.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix="roto_restore_", dir=root.parent))
+        try:
+            if archive_path is not None:
+                with zipfile.ZipFile(archive_path) as archive:
+                    for member in archive.infolist():
+                        destination = (staging / member.filename).resolve()
+                        if not destination.is_relative_to(staging.resolve()):
+                            raise ValueError("Invalid Roto session archive path.")
+                    archive.extractall(staging)
+            if root.exists():
+                root.rename(root.with_name(f"{root.name}_previous_{uuid4().hex}"))
+            staging.rename(root)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+        self._pending_video = None
+        if self._sammie is not None:
+            w = self._sammie
+            w.point_manager.points = []
+            w.settings_mgr.session_settings = type(w.settings_mgr.session_settings)()
+            w.settings_mgr.load_session_settings()
+            if archive_path is not None:
+                current_frame = w.settings_mgr.get_session_setting("current_frame", 0)
+                w.resume_prev_session()
+                w.frame_slider.setValue(current_frame)
+            else:
+                from sammie import core
+                core.VideoInfo.total_frames = 0
+                w.frame_slider.setRange(0, 0)
+                w._load_session_ui_state()
+                w.viewer.pixmap_item.setPixmap(QPixmap())
+        self._objects = []
+        self._tree.clear()
+        self.refresh_objects()
+        self.objects_changed.emit()
 
     def shutdown(self) -> None:
         """Persist the embedded editor's session on app close.
@@ -452,12 +527,12 @@ class RotoWidget(QWidget):
         from PySide6.QtWidgets import QFileDialog
         object_ids = self._selected_object_ids()
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Matte Video", "matte.mkv", "Matte video (*.mkv *.mov);;All files (*.*)"
+            self, "Export Matte Video", "matte.mov", "QuickTime ProRes HQ (*.mov)"
         )
         if not path:
             return
         # Keep soft alpha edges in exported mattes; tracking still gets binary.
-        self._start_matte_worker("export", object_ids, output=Path(path), binary=False)
+        self._start_matte_worker("export", object_ids, output=Path(path).with_suffix(".mov"), binary=False)
 
     def _start_matte_worker(self, role: str, object_ids: list[int] | None, output: Path | None = None,
                             binary: bool = True) -> bool:
